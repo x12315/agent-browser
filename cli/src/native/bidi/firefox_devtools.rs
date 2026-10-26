@@ -48,9 +48,9 @@ impl RdpClient {
         Self::from_stream(s).await
     }
 
-    /// Connects to a DevTools server on a loopback TCP port.
-    pub async fn connect_tcp(port: u16) -> Result<Self, String> {
-        let s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+    /// Connects to a DevTools server on a TCP endpoint.
+    pub async fn connect_tcp(host: &str, port: u16) -> Result<Self, String> {
+        let s = tokio::net::TcpStream::connect((host, port))
             .await
             .map_err(|e| format!("DevTools connect failed: {e}"))?;
         Self::from_stream(s).await

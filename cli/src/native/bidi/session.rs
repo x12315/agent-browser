@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::sync::broadcast::{self, error::TryRecvError};
 
+use super::attach::AttachTarget;
 use super::client::{remote_to_json, BidiClient};
 use super::emulation::{self, Settings as EmulationSettings};
 use super::firefox::{check_firefox_version, find_firefox, DevtoolsEndpoint, FirefoxProcess};
@@ -17,6 +18,7 @@ use crate::native::cdp::chrome::LaunchOptions;
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const DEVTOOLS_CONNECT_WINDOW: Duration = Duration::from_secs(10);
+const ATTACH_DEVTOOLS_CONNECT_WINDOW: Duration = Duration::from_secs(2);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const PROMPT_EVENTS: [&str; 2] = [
     "browsingContext.userPromptOpened",
@@ -82,21 +84,27 @@ fn proxy_capability(proxy: &str, bypass: Option<&str>) -> Value {
     cap
 }
 
-async fn connect_devtools(endpoint: &DevtoolsEndpoint) -> Result<RdpClient, String> {
-    tokio::time::timeout(DEVTOOLS_CONNECT_WINDOW, connect_devtools_loop(endpoint))
+async fn connect_devtools(
+    endpoint: &DevtoolsEndpoint,
+    window: Duration,
+) -> Result<RdpClient, String> {
+    tokio::time::timeout(window, connect_devtools_loop(endpoint, window))
         .await
         .map_err(|_| "Firefox DevTools connection timed out".to_string())?
 }
 
-async fn connect_devtools_loop(endpoint: &DevtoolsEndpoint) -> Result<RdpClient, String> {
-    let deadline = tokio::time::Instant::now() + DEVTOOLS_CONNECT_WINDOW;
+async fn connect_devtools_loop(
+    endpoint: &DevtoolsEndpoint,
+    window: Duration,
+) -> Result<RdpClient, String> {
+    let deadline = tokio::time::Instant::now() + window;
     loop {
         let attempt = match endpoint {
             #[cfg(unix)]
             DevtoolsEndpoint::Unix(path) => RdpClient::connect_unix(path).await,
             #[cfg(not(unix))]
             DevtoolsEndpoint::Unix(_) => Err("unix sockets are unavailable".to_string()),
-            DevtoolsEndpoint::Port(port) => RdpClient::connect_tcp(*port).await,
+            DevtoolsEndpoint::Tcp { host, port } => RdpClient::connect_tcp(host, *port).await,
         };
         match attempt {
             Ok(c) => return Ok(c),
@@ -130,13 +138,50 @@ impl FirefoxSession {
         .await
         .map_err(|e| format!("Firefox launch task failed: {e}"))??;
 
+        let bidi_url = format!("{}/session", process.bidi_url);
+        let devtools = process.devtools.clone();
+        Self::initialize(
+            &bidi_url,
+            &devtools,
+            Some(process),
+            options,
+            net,
+            auto_dialog,
+        )
+        .await
+    }
+
+    /// Opens a BiDi session on an already running Firefox and connects its DevTools server.
+    pub async fn attach(
+        target: &AttachTarget,
+        options: &LaunchOptions,
+        net: NetContext,
+        auto_dialog: bool,
+    ) -> Result<Self, String> {
+        Self::initialize(
+            &target.bidi_url,
+            &target.devtools,
+            None,
+            options,
+            net,
+            auto_dialog,
+        )
+        .await
+    }
+
+    async fn initialize(
+        bidi_url: &str,
+        devtools: &DevtoolsEndpoint,
+        process: Option<FirefoxProcess>,
+        options: &LaunchOptions,
+        net: NetContext,
+        auto_dialog: bool,
+    ) -> Result<Self, String> {
+        let attached = process.is_none();
         let bidi = Arc::new(
-            tokio::time::timeout(
-                START_TIMEOUT,
-                BidiClient::connect(&format!("{}/session", process.bidi_url)),
-            )
-            .await
-            .map_err(|_| "Firefox BiDi connection timed out".to_string())??,
+            tokio::time::timeout(START_TIMEOUT, BidiClient::connect(bidi_url))
+                .await
+                .map_err(|_| "Firefox BiDi connection timed out".to_string())??,
         );
         let events = bidi.subscribe();
         let mut caps = json!({
@@ -150,12 +195,22 @@ impl FirefoxSession {
         if let Some(proxy) = options.proxy.as_deref() {
             caps["proxy"] = proxy_capability(proxy, options.proxy_bypass.as_deref());
         }
-        let created = bidi
+        let created = match bidi
             .send(
                 "session.new",
                 json!({"capabilities": {"alwaysMatch": caps}}),
             )
-            .await?;
+            .await
+        {
+            Err(error) if attached && error.contains("Maximum number of active sessions") => {
+                return Err(format!(
+                    "Firefox at {bidi_url} already has a WebDriver BiDi session. Another client is attached; close it and retry."
+                ));
+            }
+            result => result?,
+        };
+        let cleanup_bidi = bidi.clone();
+        let result = async move {
         check_firefox_version(
             created["capabilities"]["browserVersion"]
                 .as_str()
@@ -170,7 +225,23 @@ impl FirefoxSession {
         )
         .await?;
 
-        let rdp = connect_devtools(&process.devtools).await?;
+        let window = if attached {
+            ATTACH_DEVTOOLS_CONNECT_WINDOW
+        } else {
+            DEVTOOLS_CONNECT_WINDOW
+        };
+        let rdp = match connect_devtools(devtools, window).await {
+            Ok(rdp) => rdp,
+            Err(_) if attached => {
+                let DevtoolsEndpoint::Tcp { host, port } = devtools else {
+                    return Err("Firefox DevTools server is not reachable".into());
+                };
+                return Err(format!(
+                    "Firefox DevTools server is not reachable at {host}:{port}. Start Firefox with --start-debugger-server {port} and the prefs devtools.debugger.remote-enabled=true, devtools.chrome.enabled=true and devtools.debugger.prompt-connection=false, or pass ?devtools={port} in the connect URL."
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let root = rdp.request("root", "getRoot", json!({})).await?;
         let accessibility_actor = root["parentAccessibilityActor"]
             .as_str()
@@ -180,10 +251,28 @@ impl FirefoxSession {
             .await?;
 
         let tree = bidi.send("browsingContext.getTree", json!({})).await?;
-        let context = tree["contexts"][0]["context"]
-            .as_str()
+        let mut contexts: Vec<String> = tree["contexts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["context"].as_str().map(str::to_string))
+            .collect();
+        if contexts.is_empty() && attached {
+            let created = bidi
+                .send("browsingContext.create", json!({"type": "tab"}))
+                .await?;
+            contexts.push(
+                created["context"]
+                    .as_str()
+                    .ok_or("Firefox did not return the created browsing context")?
+                    .to_string(),
+            );
+        }
+        let context = contexts
+            .first()
             .ok_or("Firefox reported no browsing context")?
-            .to_string();
+            .clone();
+        let next_tab_id = contexts.len() as u32 + 1;
         let dispatcher = Some(super::network::spawn_dispatcher(bidi.clone(), net.clone()));
         let emulation = EmulationSettings {
             user_agent: options.user_agent.clone(),
@@ -194,12 +283,16 @@ impl FirefoxSession {
             ..EmulationSettings::default()
         };
         let session = Self {
-            process: Some(process),
+            process,
             bidi,
             rdp,
             accessibility_actor,
-            tab_ids: HashMap::from([(context.clone(), 1)]),
-            next_tab_id: 2,
+            tab_ids: contexts
+                .into_iter()
+                .enumerate()
+                .map(|(index, context)| (context, index as u32 + 1))
+                .collect(),
+            next_tab_id,
             top_context: context.clone(),
             context,
             refs: HashMap::new(),
@@ -219,6 +312,14 @@ impl FirefoxSession {
         };
         let _ = emulation::apply_to_context(&session, &session.context).await;
         Ok(session)
+        }
+        .await;
+        if attached && result.is_err() {
+            let _ = cleanup_bidi
+                .send_timeout("session.end", json!({}), SHUTDOWN_TIMEOUT)
+                .await;
+        }
+        result
     }
 
     /// Records the origin of a URL the session navigated to.
@@ -244,12 +345,18 @@ impl FirefoxSession {
 
     /// True once the Firefox process has exited.
     pub fn has_exited(&mut self) -> bool {
-        self.process
-            .as_mut()
-            .is_some_and(FirefoxProcess::has_exited)
+        match self.process.as_mut() {
+            Some(process) => process.has_exited(),
+            None => self.bidi.is_closed(),
+        }
     }
 
-    /// Ends the BiDi session, then kills Firefox and deletes its profile.
+    /// Returns whether this session attached to an existing Firefox.
+    pub fn is_attached(&self) -> bool {
+        self.process.is_none()
+    }
+
+    /// Ends the BiDi session and releases any owned Firefox process.
     pub async fn close(self) {
         let _ = self
             .bidi
@@ -476,6 +583,61 @@ pub(crate) mod tests {
             dispatcher: None,
         };
         (session, tx, calls)
+    }
+
+    #[tokio::test]
+    async fn attach_ends_created_session_after_initialization_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/session", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for expected in ["session.new", "session.subscribe", "session.end"] {
+                let message = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let request: Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
+                assert_eq!(request["method"], expected, "{request}");
+                let response = match expected {
+                    "session.new" => json!({
+                        "type": "success",
+                        "id": request["id"],
+                        "result": {"capabilities": {"browserVersion": "150.0"}}
+                    }),
+                    "session.subscribe" => json!({
+                        "type": "error",
+                        "id": request["id"],
+                        "error": "unsupported operation",
+                        "message": "subscription rejected"
+                    }),
+                    "session.end" => json!({
+                        "type": "success",
+                        "id": request["id"],
+                        "result": {}
+                    }),
+                    _ => unreachable!(),
+                };
+                ws.send(Message::Text(response.to_string())).await.unwrap();
+            }
+        });
+        let target = AttachTarget {
+            bidi_url: url,
+            devtools: DevtoolsEndpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 6000,
+            },
+        };
+        let options = LaunchOptions::default();
+
+        let error = FirefoxSession::attach(&target, &options, NetContext::default(), false)
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(error, "unsupported operation: subscription rejected");
+        server.await.unwrap();
     }
 
     pub(crate) type Messages = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;

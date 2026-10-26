@@ -95,6 +95,11 @@ impl BidiClient {
         self.events.subscribe()
     }
 
+    /// Returns whether the BiDi WebSocket reader has stopped.
+    pub fn is_closed(&self) -> bool {
+        self.reader.is_finished()
+    }
+
     /// Sends a command with the default 30s timeout and returns its `result`.
     pub async fn send(&self, method: &str, params: Value) -> Result<Value, String> {
         self.send_timeout(method, params, DEFAULT_TIMEOUT).await

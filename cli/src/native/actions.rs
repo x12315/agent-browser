@@ -393,6 +393,7 @@ const LOCAL_ONLY_LAUNCH_FIELDS: &[&str] = &[
 enum AttachedTarget {
     CdpUrl(String),
     CdpPort(u64),
+    Firefox(String),
     AutoConnect,
     Provider(String),
 }
@@ -420,10 +421,29 @@ impl AttachedTarget {
             .filter(|target| !matches!(target, Self::Provider(p) if p == "ios" || p == "safari"))
     }
 
+    fn from_successful_launch(cmd: &Value, engine: &str) -> Option<Self> {
+        if engine == "firefox" {
+            if let Some(url) = cmd.get("cdpUrl").and_then(Value::as_str) {
+                return Some(Self::Firefox(url.to_string()));
+            }
+            if let Some(port) = cmd.get("cdpPort").and_then(Value::as_u64) {
+                return Some(Self::Firefox(port.to_string()));
+            }
+        }
+        Self::from_launch_command(cmd)
+    }
+
     fn insert_into(&self, cmd: &mut serde_json::Map<String, Value>) {
         let (key, value) = match self {
             Self::CdpUrl(url) => ("cdpUrl", json!(url)),
             Self::CdpPort(port) => ("cdpPort", json!(port)),
+            Self::Firefox(target) => {
+                cmd.insert("engine".to_string(), json!("firefox"));
+                match target.parse::<u64>() {
+                    Ok(port) => ("cdpPort", json!(port)),
+                    Err(_) => ("cdpUrl", json!(target)),
+                }
+            }
             Self::AutoConnect => ("autoConnect", json!(true)),
             Self::Provider(provider) => ("provider", json!(provider)),
         };
@@ -454,6 +474,17 @@ fn launch_connection_is_external(
     provider_name: Option<&str>,
 ) -> bool {
     launch_connection_identity(cdp_url, cdp_port, auto_connect, provider_name).0 != "local"
+}
+
+fn launch_engine(cmd: &Value, state: &DaemonState, has_connection_target: bool) -> Option<String> {
+    cmd.get("engine")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| env::var("AGENT_BROWSER_ENGINE").ok())
+        .or_else(|| {
+            (!has_connection_target && has_active_browser_session(state))
+                .then(|| state.engine.clone())
+        })
 }
 
 fn validate_ca_cert_launch_mode(
@@ -918,7 +949,8 @@ impl DaemonState {
             self.active_provider_connection,
             self.browser
                 .as_ref()
-                .is_some_and(BrowserManager::blocks_default_idle_shutdown),
+                .is_some_and(BrowserManager::blocks_default_idle_shutdown)
+                || self.firefox.as_ref().is_some_and(|ff| ff.is_attached()),
         )
     }
 
@@ -3220,7 +3252,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         if restore_key_change_needs_launch {
             true
         } else if state.engine == "firefox" {
-            state.firefox.as_mut().is_none_or(|ff| ff.has_exited())
+            match state.firefox.as_mut() {
+                Some(ff) => firefox_session_has_exited(ff).await,
+                None => true,
+            }
         } else if let Some(ref mut mgr) = state.browser {
             mgr.has_process_exited() || !mgr.is_connection_alive().await
         } else {
@@ -4449,16 +4484,43 @@ async fn auto_launch_inner(
     let cdp = env::var("AGENT_BROWSER_CDP").ok();
     let auto_connect = env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok();
     let provider = env::var("AGENT_BROWSER_PROVIDER").ok();
-    if engine.as_deref() == Some("firefox") {
+    let allowed_domains = current_allowed_domains(state).await;
+    ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
+        allowed_domains: &allowed_domains,
+        cdp_url: cdp.as_deref(),
+        cdp_port: None,
+        auto_connect,
+        profile: options.profile.as_deref(),
+        provider_name: provider.as_deref(),
+        args: &options.args,
+        restore_key: state.session_name.as_deref(),
+        storage_state: options.storage_state.as_deref(),
+    })?;
+    let firefox_target = cdp
+        .as_deref()
+        .map(bidi::attach::parse_attach_url)
+        .transpose()?
+        .flatten();
+    if engine.as_deref() == Some("firefox") || firefox_target.is_some() {
         reject_firefox_launch_extras(
             &launch_enable_features_from_env(),
             &launch_init_script_paths_from_env(),
             &plugins,
         )?;
-        let allowed = current_allowed_domains(state).await;
-        return launch_firefox(state, options, cdp, auto_connect, provider, allowed)
-            .await
-            .map(|_| ());
+        launch_firefox(
+            state,
+            options,
+            cdp.clone(),
+            auto_connect,
+            provider,
+            allowed_domains,
+            firefox_target,
+        )
+        .await?;
+        if let Some(target) = cdp {
+            state.attached_target = Some(AttachedTarget::Firefox(target));
+        }
+        return Ok(());
     }
     validate_ca_cert_launch_mode(
         &options,
@@ -4467,7 +4529,6 @@ async fn auto_launch_inner(
     )?;
     let enable_features = launch_enable_features_from_env();
     let init_script_paths = launch_init_script_paths_from_env();
-    let allowed_domains = current_allowed_domains(state).await;
     options.restrict_webrtc = !allowed_domains.is_empty();
     // Extract storage_state before options is moved into BrowserManager::launch.
     let storage_state_path = options.storage_state.clone();
@@ -4483,18 +4544,24 @@ async fn auto_launch_inner(
     write_extensions_file(&state.session_id);
 
     if let Some(cdp) = cdp {
-        ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-            allowed_domains: &allowed_domains,
-            cdp_url: Some(cdp.as_str()),
-            cdp_port: None,
-            auto_connect: false,
-            profile: options.profile.as_deref(),
-            provider_name: None,
-            args: &options.args,
-            restore_key: restore_key.as_deref(),
-            storage_state,
-        })?;
-        let mgr = BrowserManager::connect_cdp_when_listening(&cdp).await?;
+        let mgr = match detect_attach_connection(&cdp).await? {
+            AttachConnection::Cdp(manager) => *manager,
+            AttachConnection::Firefox(target) => {
+                reject_firefox_launch_extras(&enable_features, &init_script_paths, &plugins)?;
+                launch_firefox(
+                    state,
+                    options,
+                    Some(cdp.clone()),
+                    auto_connect,
+                    provider.clone(),
+                    allowed_domains,
+                    Some(target),
+                )
+                .await?;
+                state.attached_target = Some(AttachedTarget::Firefox(cdp));
+                return Ok(());
+            }
+        };
         let hash = launch_hash(
             &options,
             &allowed_domains,
@@ -4521,17 +4588,6 @@ async fn auto_launch_inner(
     }
 
     if auto_connect {
-        ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-            allowed_domains: &allowed_domains,
-            cdp_url: None,
-            cdp_port: None,
-            auto_connect: true,
-            profile: options.profile.as_deref(),
-            provider_name: None,
-            args: &options.args,
-            restore_key: restore_key.as_deref(),
-            storage_state,
-        })?;
         let hash = launch_hash(
             &options,
             &allowed_domains,
@@ -4568,17 +4624,6 @@ async fn auto_launch_inner(
     // command arriving before an explicit "launch") honours the provider env.
     if let Some(provider) = provider {
         let p = provider.to_lowercase();
-        ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-            allowed_domains: &allowed_domains,
-            cdp_url: None,
-            cdp_port: None,
-            auto_connect: false,
-            profile: options.profile.as_deref(),
-            provider_name: Some(p.as_str()),
-            args: &options.args,
-            restore_key: restore_key.as_deref(),
-            storage_state,
-        })?;
         // ios/safari are device providers handled via explicit launch command
         if !p.is_empty() && p != "ios" && p != "safari" {
             let conn = providers::connect_provider_with_plugins(&p, &plugins).await?;
@@ -4629,18 +4674,6 @@ async fn auto_launch_inner(
             }
         }
     }
-
-    ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-        allowed_domains: &allowed_domains,
-        cdp_url: None,
-        cdp_port: None,
-        auto_connect: false,
-        profile: options.profile.as_deref(),
-        provider_name: None,
-        args: &options.args,
-        restore_key: restore_key.as_deref(),
-        storage_state,
-    })?;
 
     apply_launch_mutator_plugins(state, &mut options, plugins).await?;
     validate_ca_cert_launch_mode(&options, engine.as_deref(), false)?;
@@ -5268,9 +5301,17 @@ async fn handle_launch_with_deadline(
 ) -> Result<Value, String> {
     let resolved = resolve_launch_target(cmd, state.attached_target.as_ref());
     let cmd = resolved.as_ref().unwrap_or(cmd);
+    let previous_domain_filter = state.domain_filter.read().await.clone();
     let result = handle_launch_for_target(cmd, state, deadline).await;
+    if result.is_err() {
+        *state.domain_filter.write().await = previous_domain_filter;
+    }
     if result.is_ok() {
-        state.attached_target = AttachedTarget::from_launch_command(cmd);
+        if let Some(target) = AttachedTarget::from_successful_launch(cmd, &state.engine) {
+            state.attached_target = Some(target);
+        } else if AttachedTarget::named_by(cmd).is_some() {
+            state.attached_target = None;
+        }
     }
     result
 }
@@ -5339,7 +5380,67 @@ async fn set_domain_filter(state: &DaemonState, domains: &[String]) {
     };
 }
 
-/// Validates the options and launches (or reuses) an owned Firefox for both launch paths.
+fn connection_target_label(target: &str) -> String {
+    if let Ok(port) = target.parse::<u16>() {
+        return format!("port {port}");
+    }
+    url::Url::parse(target)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| target.to_string())
+}
+
+fn combine_cdp_and_firefox_attach_errors(
+    cdp_error: &str,
+    target: &str,
+    bidi_error: &str,
+) -> String {
+    format!(
+        "{cdp_error}; WebDriver BiDi: no Firefox remote agent for {} ({bidi_error})",
+        connection_target_label(target)
+    )
+}
+
+enum AttachConnection {
+    Cdp(Box<BrowserManager>),
+    Firefox(bidi::attach::AttachTarget),
+}
+
+async fn detect_attach_connection(target: &str) -> Result<AttachConnection, String> {
+    if let Some(target) = bidi::attach::parse_attach_url(target)? {
+        return Ok(AttachConnection::Firefox(target));
+    }
+    let cdp_error = match BrowserManager::connect_cdp_when_listening(target).await {
+        Ok(manager) => return Ok(AttachConnection::Cdp(Box::new(manager))),
+        Err(error) => error,
+    };
+    let can_probe_bidi = target.parse::<u16>().is_ok()
+        || url::Url::parse(target).is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
+    if !can_probe_bidi {
+        return Err(cdp_error);
+    }
+    match bidi::attach::probe_attach_target(target).await {
+        Ok(target) => Ok(AttachConnection::Firefox(target)),
+        Err(error) => Err(combine_cdp_and_firefox_attach_errors(
+            &cdp_error, target, &error,
+        )),
+    }
+}
+
+async fn firefox_session_has_exited(session: &mut bidi::session::FirefoxSession) -> bool {
+    session.has_exited()
+        || (session.is_attached()
+            && session
+                .bidi
+                .send_timeout(
+                    "browsingContext.getTree",
+                    json!({}),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .is_err())
+}
+
+/// Starts or attaches to Firefox and reuses it when launch settings match.
 async fn launch_firefox(
     state: &mut DaemonState,
     mut options: LaunchOptions,
@@ -5347,24 +5448,33 @@ async fn launch_firefox(
     auto_connect: bool,
     provider: Option<String>,
     allowed_domains: Vec<String>,
+    attach_target: Option<bidi::attach::AttachTarget>,
 ) -> Result<Value, String> {
-    bidi::firefox::validate_firefox_options(
-        &options,
-        cdp.as_deref(),
-        auto_connect,
-        provider.as_deref(),
-    )?;
-    ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-        allowed_domains: &allowed_domains,
-        cdp_url: None,
-        cdp_port: None,
-        auto_connect: false,
-        profile: None,
-        provider_name: None,
-        args: &[],
-        restore_key: state.session_name.as_deref(),
-        storage_state: options.storage_state.as_deref(),
-    })?;
+    bidi::firefox::validate_firefox_options(&options, auto_connect, provider.as_deref())?;
+    let attach_target = if let Some(target) = attach_target {
+        Some(target)
+    } else if let Some(target) = cdp.as_deref() {
+        Some(
+            if let Some(parsed) = bidi::attach::parse_attach_url(target)? {
+                parsed
+            } else {
+                bidi::attach::probe_attach_target(target)
+                    .await
+                    .map_err(|reason| {
+                        format!(
+                            "--engine firefox expects a Firefox WebDriver BiDi endpoint at {}; {}",
+                            connection_target_label(target),
+                            reason
+                        )
+                    })?
+            },
+        )
+    } else {
+        None
+    };
+    if attach_target.is_some() && state.pin_tab {
+        return Err("--pin-tab is not supported with Firefox attach".to_string());
+    }
     options.restrict_webrtc = !allowed_domains.is_empty();
     let proxy_credentials = options
         .proxy_username
@@ -5377,12 +5487,20 @@ async fn launch_firefox(
         &[],
         &[],
         Some("firefox"),
-        "launch",
-        None,
+        if attach_target.is_some() {
+            "firefox-bidi"
+        } else {
+            "launch"
+        },
+        attach_target.as_ref().and(cdp.as_deref()),
     );
     let storage_state = options.storage_state.clone();
     let hash_matches = state.launch_hash == Some(hash);
-    let reuse_session = state.firefox.as_mut().is_some_and(|ff| !ff.has_exited());
+    let reuse_session = if let Some(ff) = state.firefox.as_mut() {
+        !firefox_session_has_exited(ff).await
+    } else {
+        false
+    };
     if reuse_session && hash_matches {
         load_storage_state(state, &storage_state).await?;
         *state.proxy_credentials.write().await = proxy_credentials;
@@ -5396,14 +5514,39 @@ async fn launch_firefox(
     state.ref_map.invalidate_all_documents();
     state.reset_input_state();
     let net = bidi::network::NetContext::from_state(state);
-    let mut session =
-        bidi::session::FirefoxSession::launch(&options, net, state.auto_dialog).await?;
+    let mut session = if let Some(target) = attach_target.as_ref() {
+        bidi::session::FirefoxSession::attach(target, &options, net, state.auto_dialog).await?
+    } else {
+        bidi::session::FirefoxSession::launch(&options, net, state.auto_dialog).await?
+    };
+    if attach_target.is_some() {
+        if let Some(path) = options.download_path.as_deref() {
+            if let Err(error) = session
+                .bidi
+                .send(
+                    "browser.setDownloadBehavior",
+                    json!({"downloadBehavior": {"type": "allowed", "destinationFolder": path}}),
+                )
+                .await
+            {
+                session.close().await;
+                return Err(format!(
+                    "Unable to apply --download-path to attached Firefox: {error}"
+                ));
+            }
+        }
+    }
     if !allowed_domains.is_empty()
         || proxy_credentials.is_some()
         || !state.routes.read().await.is_empty()
         || !state.origin_headers.read().await.is_empty()
     {
-        bidi::network::ensure_intercept(&mut session).await?;
+        if let Err(error) = bidi::network::ensure_intercept(&mut session).await {
+            if attach_target.is_some() {
+                session.close().await;
+            }
+            return Err(error);
+        }
     }
     state.engine = "firefox".to_string();
     write_engine_file(&state.session_id, &state.engine);
@@ -5429,13 +5572,29 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         .get("headless")
         .and_then(|v| v.as_bool())
         .unwrap_or_else(|| !headed_from_env());
-    let cdp_url = cmd.get("cdpUrl").and_then(|v| v.as_str());
     let cdp_port = cmd.get("cdpPort").and_then(|v| v.as_u64());
+    let cdp_url = cmd
+        .get("cdpUrl")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            cdp_port
+                .is_none()
+                .then(|| env::var("AGENT_BROWSER_CDP").ok())
+                .flatten()
+        });
+    let cdp_url = cdp_url.as_deref();
     let auto_connect = cmd
         .get("autoConnect")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let provider_name = cmd.get("provider").and_then(|v| v.as_str());
+        .unwrap_or(false)
+        || env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok();
+    let provider_name = cmd
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| env::var("AGENT_BROWSER_PROVIDER").ok());
+    let provider_name = provider_name.as_deref();
     let enable_features =
         string_array_from_command(cmd, "enable").unwrap_or_else(launch_enable_features_from_env);
     let init_script_paths = string_array_from_command(cmd, "initScripts")
@@ -5449,12 +5608,16 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         });
     let storage_state = cmd.get("storageState").and_then(|v| v.as_str());
     let storage_state_owned = storage_state.map(|s| s.to_string());
-    let engine = cmd
-        .get("engine")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| env::var("AGENT_BROWSER_ENGINE").ok())
-        .or_else(|| has_active_browser_session(state).then(|| state.engine.clone()));
+    let engine = launch_engine(cmd, state, cdp_url.is_some() || cdp_port.is_some());
+    let firefox_target = cdp_url
+        .map(bidi::attach::parse_attach_url)
+        .transpose()?
+        .flatten();
+    let engine = if firefox_target.is_some() {
+        Some("firefox".to_string())
+    } else {
+        engine
+    };
     let profile = cmd
         .get("profile")
         .and_then(|v| v.as_str())
@@ -5589,12 +5752,8 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
     if engine.as_deref() == Some("firefox") {
         let cdp = cdp_url
             .map(String::from)
-            .or_else(|| cdp_port.map(|p| p.to_string()))
-            .or_else(|| env::var("AGENT_BROWSER_CDP").ok());
-        let auto_connect = auto_connect || env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok();
-        let provider = provider_name
-            .map(String::from)
-            .or_else(|| env::var("AGENT_BROWSER_PROVIDER").ok());
+            .or_else(|| cdp_port.map(|p| p.to_string()));
+        let provider = provider_name.map(String::from);
         reject_firefox_launch_extras(
             &enable_features,
             &init_script_paths,
@@ -5603,19 +5762,16 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         if let Some(domains) = &requested_allowed_domains {
             set_domain_filter(state, domains).await;
         }
-        let result = launch_firefox(
+        return launch_firefox(
             state,
             launch_options,
             cdp,
             auto_connect,
             provider,
             allowed_domains,
+            None,
         )
         .await;
-        if result.is_err() {
-            *state.domain_filter.write().await = previous_domain_filter;
-        }
-        return result;
     }
 
     let external_launch =
@@ -5630,20 +5786,22 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
             .await?;
         validate_ca_cert_launch_mode(&launch_options, engine.as_deref(), false)?;
     }
-    ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-        allowed_domains: &allowed_domains,
-        cdp_url,
-        cdp_port,
-        auto_connect,
-        profile: launch_options.profile.as_deref(),
-        provider_name,
-        args: &launch_options.args,
-        restore_key: restore_key.as_deref(),
-        storage_state,
-    })?;
+    if cdp_url.is_none() && cdp_port.is_none() {
+        ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
+            allowed_domains: &allowed_domains,
+            cdp_url,
+            cdp_port,
+            auto_connect,
+            profile: launch_options.profile.as_deref(),
+            provider_name,
+            args: &launch_options.args,
+            restore_key: restore_key.as_deref(),
+            storage_state,
+        })?;
 
-    if let Some(domains) = &requested_allowed_domains {
-        set_domain_filter(state, domains).await;
+        if let Some(domains) = &requested_allowed_domains {
+            set_domain_filter(state, domains).await;
+        }
     }
 
     let (connection_kind, connection_target) =
@@ -5713,28 +5871,38 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
     let has_proxy_auth = launch_options.proxy_username.is_some();
     store_proxy_credentials(state, &launch_options).await;
 
-    if let Some(url) = cdp_url {
+    let cdp_target = cdp_url
+        .map(str::to_string)
+        .or_else(|| cdp_port.map(|port| port.to_string()));
+    if let Some(target) = cdp_target {
+        if let Some(domains) = &requested_allowed_domains {
+            set_domain_filter(state, domains).await;
+        }
+        let mgr = match detect_attach_connection(&target).await? {
+            AttachConnection::Cdp(manager) => *manager,
+            AttachConnection::Firefox(attach_target) => {
+                reject_firefox_launch_extras(
+                    &enable_features,
+                    &init_script_paths,
+                    &plugins_from_command_or_env(cmd),
+                )?;
+                let mut result = launch_firefox(
+                    state,
+                    launch_options,
+                    Some(target),
+                    auto_connect,
+                    provider_name.map(str::to_string),
+                    allowed_domains,
+                    Some(attach_target),
+                )
+                .await?;
+                result["relaunchedBrowser"] = json!(had_browser_before_launch);
+                return Ok(result);
+            }
+        };
         state.reset_input_state();
         set_engine(state, engine.as_deref());
-        state.browser = Some(BrowserManager::connect_cdp_when_listening(url).await?);
-        state.launch_hash = Some(new_hash);
-        state.subscribe_to_browser_events();
-        state.start_fetch_handler();
-        state.start_dialog_handler();
-        apply_tab_binding_on_attach_or_rollback(state).await?;
-        state.update_stream_client().await;
-        install_network_controls_or_close(state, has_proxy_auth).await?;
-        apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
-        try_auto_restore_state(state).await;
-        load_storage_state_or_rollback(state, &storage_state_owned).await?;
-        state.effective_ca_cert = effective_ca_cert;
-        return Ok(json!({ "launched": true, "relaunchedBrowser": had_browser_before_launch }));
-    }
-
-    if let Some(port) = cdp_port {
-        state.reset_input_state();
-        set_engine(state, engine.as_deref());
-        state.browser = Some(BrowserManager::connect_cdp_when_listening(&port.to_string()).await?);
+        state.browser = Some(mgr);
         state.launch_hash = Some(new_hash);
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
@@ -18075,6 +18243,30 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             resolve_launch_target(&cmd, Some(&attached)),
             Some(json!({ "action": "launch", "cdpPort": 9222, "allowedDomains": ["example.com"] }))
         );
+        let attached =
+            AttachedTarget::Firefox("ws://127.0.0.1:9333/session?devtools=6080".to_string());
+        assert_eq!(
+            resolve_launch_target(&cmd, Some(&attached)),
+            Some(json!({
+                "action": "launch",
+                "engine": "firefox",
+                "cdpUrl": "ws://127.0.0.1:9333/session?devtools=6080",
+                "allowedDomains": ["example.com"]
+            }))
+        );
+    }
+
+    #[test]
+    fn test_cdp_and_firefox_attach_failure_keeps_both_errors() {
+        assert_eq!(
+            combine_cdp_and_firefox_attach_errors(
+                "CDP discovery failed: connection refused",
+                "http://127.0.0.1:9333?devtools=6080",
+                "handshake failed"
+            ),
+            "CDP discovery failed: connection refused; WebDriver BiDi: no Firefox remote agent for http://127.0.0.1:9333/?devtools=6080 (handshake failed)"
+        );
+        assert!(connection_target_label("http://[::1]:9333").contains("[::1]"));
     }
 
     #[tokio::test]
@@ -19588,6 +19780,17 @@ mod firefox_routing_tests {
         (state, calls)
     }
 
+    #[tokio::test]
+    async fn attached_firefox_liveness_checks_the_bidi_connection() {
+        let _guard = clean_env();
+        let (mut session, _tx, calls) = fake_session().await;
+        assert!(!firefox_session_has_exited(&mut session).await);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["browsingContext.getTree"]
+        );
+    }
+
     fn navigations(calls: &Arc<std::sync::Mutex<Vec<String>>>) -> usize {
         let calls = calls.lock().unwrap();
         calls
@@ -19597,7 +19800,7 @@ mod firefox_routing_tests {
     }
 
     #[tokio::test]
-    async fn implicit_launch_rejects_cdp_from_env_before_launching() {
+    async fn implicit_launch_probes_cdp_from_env_as_firefox_bidi() {
         let guard = clean_env();
         guard.set("AGENT_BROWSER_CDP", "ws://127.0.0.1:9222");
         let mut state = DaemonState::new();
@@ -19609,7 +19812,7 @@ mod firefox_routing_tests {
         assert_eq!(resp["success"], false);
         let error = resp["error"].as_str().unwrap();
         assert!(
-            error.contains("--cdp is not supported with --engine firefox"),
+            error.contains("--engine firefox expects a Firefox WebDriver BiDi endpoint"),
             "{error}"
         );
         assert!(state.firefox.is_none());
@@ -19632,6 +19835,10 @@ mod firefox_routing_tests {
             .unwrap_err();
         assert!(e.contains("--provider"), "{e}");
         guard.remove("AGENT_BROWSER_PROVIDER");
+        let e = handle_launch(&launch(json!({"autoConnect":true})), &mut state)
+            .await
+            .unwrap_err();
+        assert!(e.contains("--auto-connect"), "{e}");
         let e = handle_launch(&launch(json!({"profile":"/tmp/p"})), &mut state)
             .await
             .unwrap_err();
@@ -19685,7 +19892,7 @@ mod firefox_routing_tests {
             None,
         );
         state.launch_hash = Some(hash);
-        let r = launch_firefox(&mut state, options, None, false, None, Vec::new())
+        let r = launch_firefox(&mut state, options, None, false, None, Vec::new(), None)
             .await
             .unwrap();
         assert_eq!(r["reused"], true);
@@ -19736,7 +19943,7 @@ mod firefox_routing_tests {
             None,
         );
         state.launch_hash = Some(hash);
-        launch_firefox(&mut state, options, None, false, None, Vec::new())
+        launch_firefox(&mut state, options, None, false, None, Vec::new(), None)
             .await
             .unwrap();
         assert_eq!(
@@ -19756,24 +19963,24 @@ mod firefox_routing_tests {
             None,
         );
         state.launch_hash = Some(hash);
-        launch_firefox(&mut state, options, None, false, None, Vec::new())
+        launch_firefox(&mut state, options, None, false, None, Vec::new(), None)
             .await
             .unwrap();
         assert_eq!(*state.proxy_credentials.read().await, None);
     }
 
     #[tokio::test]
-    async fn implicit_launch_rejects_allowed_domains_with_a_session_name() {
+    async fn launch_rejects_allowed_domains_with_a_session_name() {
         let _guard = clean_env();
-        let (mut state, _calls) = firefox_state().await;
+        let mut state = DaemonState::new();
         state.session_name = Some("k".into());
-        let e = launch_firefox(
+        let e = handle_launch(
+            &json!({
+                "action": "launch",
+                "engine": "firefox",
+                "allowedDomains": ["a.test"]
+            }),
             &mut state,
-            launch_options_from_env(),
-            None,
-            false,
-            None,
-            vec!["a.test".into()],
         )
         .await
         .unwrap_err();
@@ -19784,7 +19991,57 @@ mod firefox_routing_tests {
     }
 
     #[tokio::test]
-    async fn chrome_only_action_errors_without_touching_the_browser_and_before_other_gates() {
+    async fn retained_cdp_target_is_checked_before_firefox_allowlist_validation() {
+        let guard = clean_env();
+        guard.set("AGENT_BROWSER_CDP", "9333");
+        let mut state = DaemonState::new();
+
+        let error = handle_launch(
+            &json!({
+                "action": "launch",
+                "engine": "firefox",
+                "allowedDomains": ["a.test"]
+            }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("not supported with --cdp"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn firefox_attach_rejects_external_options_from_environment() {
+        let guard = clean_env();
+        let mut state = DaemonState::new();
+        guard.set("AGENT_BROWSER_AUTO_CONNECT", "1");
+        let error = handle_launch(
+            &json!({
+                "action": "launch",
+                "cdpUrl": "ws://127.0.0.1:9333/session"
+            }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("--auto-connect"), "{error}");
+
+        guard.remove("AGENT_BROWSER_AUTO_CONNECT");
+        guard.set("AGENT_BROWSER_PROVIDER", "browserbox");
+        let error = handle_launch(
+            &json!({
+                "action": "launch",
+                "cdpUrl": "ws://127.0.0.1:9333/session"
+            }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("--provider"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn chrome_only_action_errors_after_checking_attached_firefox_liveness() {
         let _guard = clean_env();
         let (mut state, calls) = firefox_state().await;
         state.backend_type = BackendType::WebDriver;
@@ -19803,7 +20060,10 @@ mod firefox_routing_tests {
             .as_str()
             .unwrap()
             .contains("not supported on Firefox"));
-        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["browsingContext.getTree", "browsingContext.getTree"]
+        );
     }
 
     #[tokio::test]
@@ -19852,5 +20112,60 @@ mod firefox_routing_tests {
         let resp = execute_command(&json!({"id":"3","action":"deny"}), &mut state).await;
         assert_eq!(resp["data"]["denied"], true);
         assert_eq!(navigations(&calls), 1);
+    }
+
+    #[tokio::test]
+    async fn named_targets_do_not_inherit_the_previous_engine() {
+        let guard = clean_env();
+        guard.remove("AGENT_BROWSER_ENGINE");
+        let mut state = DaemonState::new();
+        state.active_provider_session = Some(ActiveProviderSession {
+            session: providers::ProviderSession {
+                provider: "test".into(),
+                session_id: String::new(),
+            },
+            plugins: Vec::new(),
+        });
+        state.engine = "firefox".into();
+
+        assert_eq!(launch_engine(&json!({}), &state, true), None);
+        assert_eq!(
+            launch_engine(&json!({}), &state, false).as_deref(),
+            Some("firefox")
+        );
+        assert_eq!(
+            launch_engine(&json!({ "engine": "firefox" }), &state, true).as_deref(),
+            Some("firefox")
+        );
+    }
+
+    #[tokio::test]
+    async fn firefox_attach_rejects_pin_tab_and_restores_cleared_domains() {
+        let _guard = clean_env();
+        let mut state = DaemonState::new();
+        state.pin_tab = true;
+        *state.domain_filter.write().await = Some(DomainFilter::new("blocked.test"));
+
+        let error = handle_launch(
+            &json!({
+                "action": "launch",
+                "cdpUrl": "ws://127.0.0.1:9333/session",
+                "allowedDomains": []
+            }),
+            &mut state,
+        )
+        .await;
+
+        assert!(error.unwrap_err().contains("--pin-tab"));
+        assert_eq!(
+            state
+                .domain_filter
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .allowed_domains,
+            vec!["blocked.test".to_string()]
+        );
     }
 }
