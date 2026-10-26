@@ -14,7 +14,12 @@ pub struct AttachTarget {
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn target_from_url(mut url: Url, bidi_scheme: &str) -> Result<AttachTarget, String> {
+fn target_from_url(mut url: Url) -> Result<AttachTarget, String> {
+    let bidi_scheme = if matches!(url.scheme(), "https" | "wss") {
+        "wss"
+    } else {
+        "ws"
+    };
     let host = match url
         .host()
         .ok_or_else(|| "Firefox endpoint must include a host".to_string())?
@@ -22,7 +27,6 @@ fn target_from_url(mut url: Url, bidi_scheme: &str) -> Result<AttachTarget, Stri
         url::Host::Ipv6(host) => host.to_string(),
         host => host.to_string(),
     };
-    let port = url.port_or_known_default();
     let devtools_port = url
         .query_pairs()
         .find(|(key, _)| key == "devtools")
@@ -40,10 +44,6 @@ fn target_from_url(mut url: Url, bidi_scheme: &str) -> Result<AttachTarget, Stri
         .collect();
     url.set_scheme(bidi_scheme)
         .map_err(|_| "Firefox endpoint has an invalid WebSocket scheme".to_string())?;
-    if let Some(port) = port {
-        url.set_port(Some(port))
-            .map_err(|_| "Firefox endpoint has an invalid port".to_string())?;
-    }
     url.set_path("/session");
     if query.is_empty() {
         url.set_query(None);
@@ -67,8 +67,7 @@ pub fn parse_attach_url(target: &str) -> Result<Option<AttachTarget>, String> {
     if !matches!(url.scheme(), "ws" | "wss") || url.path() != "/session" {
         return Ok(None);
     }
-    let scheme = url.scheme().to_string();
-    target_from_url(url, &scheme).map(Some)
+    target_from_url(url).map(Some)
 }
 
 /// Probes a port or HTTP URL for Firefox's WebDriver BiDi WebSocket.
@@ -81,7 +80,7 @@ pub async fn probe_attach_target(target: &str) -> Result<AttachTarget, String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err("expected an http(s)://host:port URL or a port".into());
     }
-    let bidi = target_from_url(url, "ws")?;
+    let bidi = target_from_url(url)?;
     let connect = tokio::time::timeout(PROBE_TIMEOUT, connect_async(&bidi.bidi_url)).await;
     match connect {
         Ok(Ok((mut socket, _))) => {
@@ -148,8 +147,10 @@ mod tests {
     }
 
     #[test]
-    fn https_target_preserves_its_default_port_when_probed_over_ws() {
-        let target = target_from_url(Url::parse("https://127.0.0.1").unwrap(), "ws").unwrap();
-        assert_eq!(target.bidi_url, "ws://127.0.0.1:443/session");
+    fn http_targets_keep_their_transport_security_when_probed() {
+        let secure = target_from_url(Url::parse("https://127.0.0.1?token=a").unwrap()).unwrap();
+        assert_eq!(secure.bidi_url, "wss://127.0.0.1/session?token=a");
+        let plain = target_from_url(Url::parse("http://127.0.0.1").unwrap()).unwrap();
+        assert_eq!(plain.bidi_url, "ws://127.0.0.1/session");
     }
 }
