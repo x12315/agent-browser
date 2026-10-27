@@ -84,6 +84,7 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "console",
     "errors",
     "state_save",
+    "state_checkpoint",
     "state_load",
     "state_list",
     "state_show",

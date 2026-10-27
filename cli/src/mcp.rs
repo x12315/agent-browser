@@ -1539,9 +1539,9 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_STATE_SAVE,
             "State save",
-            "Save cookies and storage state.",
-            json!({ "path": { "type": "string" } }),
-            &["path"],
+            "Save cookies and storage to a file, or omit path to checkpoint the configured restore session after validating its login checks.",
+            json!({ "path": { "type": "string", "minLength": 1 } }),
+            &[],
         ),
         tool(
             TOOL_STATE_LOAD,
@@ -2337,7 +2337,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_AUTH_LIST => call_literal(arguments, &["auth", "list"]),
         TOOL_AUTH_SHOW => call_one_string(arguments, "auth show", "name"),
         TOOL_AUTH_DELETE => call_one_string(arguments, "auth delete", "name"),
-        TOOL_STATE_SAVE => call_one_string(arguments, "state save", "path"),
+        TOOL_STATE_SAVE => call_cli_tool(arguments, state_save_command_args(arguments)?, None),
         TOOL_STATE_LOAD => call_one_string(arguments, "state load", "path"),
         TOOL_STATE_LIST => call_literal(arguments, &["state", "list"]),
         TOOL_STATE_CLEAR => call_state_clear(arguments),
@@ -2455,8 +2455,8 @@ fn cli_tool_args(
     let extra_args = optional_string_array(arguments, "extraArgs")?.unwrap_or_default();
     let mut args = vec!["--json".to_string()];
     append_common_global_args(&mut args, arguments, session)?;
-    args.extend(command_args);
     args.extend(extra_args);
+    args.extend(command_args);
     Ok(args)
 }
 
@@ -2490,6 +2490,17 @@ fn call_connect(arguments: &Value) -> Result<Value, ProtocolError> {
         None => {}
     }
     call_cli_tool(arguments, args, None)
+}
+
+fn state_save_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let mut args = vec!["state".to_string(), "save".to_string()];
+    if let Some(path) = optional_string(arguments, "path")? {
+        if path.is_empty() {
+            return Err(ProtocolError::invalid_params("path must not be empty"));
+        }
+        args.push(path);
+    }
+    Ok(args)
 }
 
 fn call_optional_one(arguments: &Value, parts: &[&str], key: &str) -> Result<Value, ProtocolError> {
@@ -4168,6 +4179,54 @@ fn write_json_line(stdout: &mut io::Stdout, value: &Value) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn state_save_checkpoint_and_export_use_cli_parser() {
+        for arguments in [json!({}), json!({"path": "/tmp/explicit-export.json"})] {
+            let args = state_save_command_args(&arguments).unwrap();
+            let flags = crate::flags::parse_flags(&args);
+            let command = crate::commands::parse_command(&args, &flags).unwrap();
+            assert_eq!(
+                command["action"],
+                if arguments.get("path").is_some() {
+                    "state_save"
+                } else {
+                    "state_checkpoint"
+                }
+            );
+            assert_eq!(command.get("path"), arguments.get("path"));
+        }
+        assert!(state_save_command_args(&json!({"path": ""})).is_err());
+        assert!(state_save_command_args(&json!({"path": 1})).is_err());
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == TOOL_STATE_SAVE)
+            .unwrap();
+        assert!(!schema["inputSchema"]["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("path"))));
+        assert_eq!(schema["inputSchema"]["properties"]["path"]["minLength"], 1);
+        let arguments = json!({"session": "task-checkpoint", "extraArgs": ["--restore", "--restore-check-text", "Account menu"]});
+        let args = cli_tool_args(
+            &arguments,
+            state_save_command_args(&arguments).unwrap(),
+            Some("task-checkpoint"),
+        )
+        .unwrap();
+        let flags = crate::flags::parse_flags(&args);
+        assert_eq!(flags.session, "task-checkpoint");
+        assert!(flags.restore_uses_session);
+        assert!(flags.cli_restore);
+        assert_eq!(flags.restore_check_text.as_deref(), Some("Account menu"));
+        assert_eq!(
+            crate::commands::parse_command(
+                &args[args.iter().position(|arg| arg == "state").unwrap()..],
+                &flags,
+            )
+            .unwrap()["action"],
+            "state_checkpoint"
+        );
+    }
+
     #[test]
     fn recording_timeline_options_use_cli_parser() {
         for operation in ["start", "restart"] {

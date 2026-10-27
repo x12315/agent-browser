@@ -559,6 +559,8 @@ pub struct DaemonState {
     pub restore_status_detail: Option<String>,
     pub restore_loaded_path: Option<String>,
     pub restore_load_failed: bool,
+    /// A failed strict capture blocks automatic writes until a checkpoint succeeds.
+    restore_checkpoint_failed: bool,
     pub restore_validation_pending: bool,
     pub restore_save_status: String,
     pub restore_saved_path: Option<String>,
@@ -715,6 +717,7 @@ impl DaemonState {
             restore_status_detail: None,
             restore_loaded_path: None,
             restore_load_failed: false,
+            restore_checkpoint_failed: false,
             restore_validation_pending: false,
             restore_save_status: "not_attempted".to_string(),
             restore_saved_path: None,
@@ -2393,10 +2396,75 @@ async fn close_before_implicit_relaunch(state: &mut DaemonState) -> Result<(), S
     }
 }
 
+fn is_restore_checkpoint_command(cmd: &Value) -> bool {
+    cmd.get("action").and_then(Value::as_str) == Some("state_checkpoint")
+        || (cmd.get("action").and_then(Value::as_str) == Some("state_save")
+            && cmd.get("path").and_then(Value::as_str).is_none())
+}
+
+fn apply_checkpoint_config_from_command(
+    cmd: &Value,
+    state: &mut DaemonState,
+) -> Result<(), String> {
+    validate_restore_config_from_command(cmd)?;
+    let restore_key = match cmd.get("restoreKey") {
+        Some(value) => value.as_str(),
+        None => state.session_name.as_deref(),
+    }
+    .filter(|key| !key.is_empty())
+    .ok_or("state save without a path requires a restore session configured with --restore")?
+    .to_string();
+    if state
+        .session_name
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .is_some_and(|key| key != restore_key)
+    {
+        return Err(
+            "Checkpoint cannot switch restore sessions; use the configured restore key".to_string(),
+        );
+    }
+    let checks = command_restore_check_fields(cmd).unwrap_or_else(|| {
+        (
+            state.restore_check_url.clone(),
+            state.restore_check_text.clone(),
+            state.restore_check_fn.clone(),
+        )
+    });
+    require_checkpoint_checks(&checks)?;
+
+    state.session_name = Some(restore_key);
+    state.restore_check_url = checks.0;
+    state.restore_check_text = checks.1;
+    state.restore_check_fn = checks.2;
+    if let Some(policy) = cmd.get("restoreSave") {
+        state.restore_save = policy.as_str().unwrap_or("auto").to_string();
+    }
+    Ok(())
+}
+
+fn require_checkpoint_checks(
+    checks: &(Option<String>, Option<String>, Option<String>),
+) -> Result<(), String> {
+    if [&checks.0, &checks.1, &checks.2].iter().any(|check| {
+        check
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    }) {
+        Ok(())
+    } else {
+        Err("Checkpoint requires an app-specific --restore-check-url, --restore-check-text, or --restore-check-fn on this command".to_string())
+    }
+}
+
 async fn apply_restore_config_after_confirmation(
     cmd: &Value,
     state: &mut DaemonState,
 ) -> Result<bool, String> {
+    if is_restore_checkpoint_command(cmd) {
+        apply_checkpoint_config_from_command(cmd, state)?;
+        return Ok(false);
+    }
     let restore_key_changed = command_changes_restore_key(cmd, state);
     let had_browser = has_active_browser_session(state);
 
@@ -2590,6 +2658,7 @@ fn skip_launch_action(action: &str) -> bool {
             | "auth_list"
             | "confirm"
             | "deny"
+            | "state_checkpoint"
             | "state_list"
             | "state_show"
             | "state_clear"
@@ -2614,7 +2683,14 @@ fn policy_actions_for_command(
     action: &str,
     needs_implicit_launch: bool,
 ) -> Vec<String> {
-    let mut actions = vec![action.to_string()];
+    // The checkpoint wire action is distinct for old-daemon compatibility,
+    // but existing state_save allow, deny, and confirmation rules still apply.
+    let policy_action = if action == "state_checkpoint" {
+        "state_save"
+    } else {
+        action
+    };
+    let mut actions = vec![policy_action.to_string()];
     // `a11y <url>` performs a real browser navigation before the audit. Keep
     // navigation deny and confirmation policies effective for the compound
     // command instead of treating it as a read-only audit.
@@ -3038,6 +3114,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "errors" => handle_errors(state).await,
         "session_info" => handle_session_info(state).await,
         "state_save" => handle_state_save(cmd, state).await,
+        "state_checkpoint" => handle_state_checkpoint(state).await,
         "state_load" => handle_state_load(cmd, state).await,
         "state_list" | "state_show" | "state_clear" | "state_clean" | "state_rename" => {
             state::dispatch_state_command(cmd)
@@ -4598,7 +4675,7 @@ async fn try_auto_restore_state(state: &mut DaemonState) {
 }
 
 async fn validate_restore_if_pending(state: &mut DaemonState) {
-    if !state.restore_validation_pending {
+    if state.restore_checkpoint_failed || !state.restore_validation_pending {
         return;
     }
     state.restore_validation_pending = false;
@@ -4627,19 +4704,20 @@ async fn validate_restored_state(state: &DaemonState) -> Result<(), String> {
     if let Some(ref pattern) = state.restore_check_url {
         let url = mgr.get_url().await.unwrap_or_default();
         if !route_url_matches(pattern, &url) {
-            return Err(format!(
-                "restore URL validation failed: '{}' did not match '{}'",
-                url, pattern
-            ));
+            return Err("Restore URL validation failed (sensitive URLs omitted)".to_string());
         }
     }
 
     if let Some(ref text) = state.restore_check_text {
-        wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?;
+        wait_for_text(&mgr.client, &session_id, text, timeout_ms)
+            .await
+            .map_err(|_| "Restore account-text validation failed".to_string())?;
     }
 
     if let Some(ref expression) = state.restore_check_fn {
-        wait_for_function(&mgr.client, &session_id, expression, timeout_ms).await?;
+        wait_for_function(&mgr.client, &session_id, expression, timeout_ms)
+            .await
+            .map_err(|_| "Restore application validation failed".to_string())?;
     }
 
     Ok(())
@@ -4733,7 +4811,7 @@ pub(crate) async fn auto_save_restore_state(
             state.restore_saved_path = None;
             return Ok(None);
         }
-        "auto" if state.restore_load_failed => {
+        "auto" if state.restore_load_failed || state.restore_checkpoint_failed => {
             state.restore_save_status = "skipped_restore_failed".to_string();
             state.restore_saved_path = None;
             return Ok(None);
@@ -7205,11 +7283,16 @@ async fn handle_session_info(state: &DaemonState) -> Result<Value, String> {
     }))
 }
 
-async fn handle_state_save(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+/// Explicit paths export state without changing restore bookkeeping. Raw
+/// pathless state_save remains supported, but new clients use state_checkpoint
+/// so old daemons cannot silently use their unvalidated optional-path export.
+async fn handle_state_save(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let path = cmd.get("path").and_then(|v| v.as_str());
+    if path.is_none() {
+        return handle_state_checkpoint(state).await;
+    }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
-    let path = cmd.get("path").and_then(|v| v.as_str());
-
     let saved_path = state::save_state(
         &mgr.client,
         &session_id,
@@ -7219,8 +7302,87 @@ async fn handle_state_save(cmd: &Value, state: &DaemonState) -> Result<Value, St
         mgr.visited_origins(),
     )
     .await?;
-
     Ok(json!({ "saved": true, "path": saved_path }))
+}
+
+/// Validate the live page before transactionally accepting it as the configured
+/// restore session's private checkpoint, even after a failed restore. The wire
+/// action never accepts an export path and uses state_save policy rules.
+async fn handle_state_checkpoint(state: &mut DaemonState) -> Result<Value, String> {
+    let restore_key = state
+        .session_name
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .ok_or("state save without a path requires a restore session configured with --restore")?
+        .to_string();
+    require_checkpoint_checks(&(
+        state.restore_check_url.clone(),
+        state.restore_check_text.clone(),
+        state.restore_check_fn.clone(),
+    ))?;
+    let result = capture_restore_checkpoint(state, &restore_key).await;
+    match result {
+        Ok(saved_path) => {
+            mark_explicit_restore_checkpoint_saved(state, &saved_path);
+            Ok(json!({ "saved": true, "path": saved_path }))
+        }
+        Err(err) => {
+            state.restore_checkpoint_failed = true;
+            if !state.restore_load_failed {
+                state.restore_status = "checkpoint_failed".to_string();
+                state.restore_status_detail = Some(
+                    "Checkpoint capture, validation, or write failed (sensitive details omitted)"
+                        .to_string(),
+                );
+                state.restore_load_failed = true;
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn capture_restore_checkpoint(
+    state: &DaemonState,
+    restore_key: &str,
+) -> Result<String, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let readiness = mgr.client.send_command(
+        "Runtime.evaluate",
+        Some(json!({
+            "expression": "document.readyState !== 'loading' && location.origin !== 'null' && !!window.localStorage",
+            "returnByValue": true
+        })),
+        Some(&session_id),
+    ).await?;
+    if readiness.get("exceptionDetails").is_some()
+        || readiness.pointer("/result/value").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(
+            "Cannot checkpoint: current page is not ready or its storage is unavailable"
+                .to_string(),
+        );
+    }
+    validate_restored_state(state).await?;
+    state::save_checkpoint_state_transactional(
+        &mgr.client,
+        &session_id,
+        restore_key,
+        &state.session_id,
+        mgr.visited_origins(),
+    )
+    .await
+}
+
+fn mark_explicit_restore_checkpoint_saved(state: &mut DaemonState, path: &str) {
+    state.restore_checkpoint_failed = false;
+    state.restore_status = "saved".to_string();
+    state.restore_status_detail = None;
+    state.restore_load_failed = false;
+    state.restore_validation_pending = false;
+    state.restore_save_status = "saved".to_string();
+    state.restore_saved_path = Some(path.to_string());
+    state.last_autosave_attempt = Some(std::time::Instant::now());
 }
 
 async fn handle_state_load(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -14630,6 +14792,276 @@ mod tests {
         assert_eq!(state.restore_save, "auto");
     }
 
+    #[tokio::test]
+    async fn test_checkpoint_payload_rejections_leave_configuration_and_session_untouched() {
+        for payload in [
+            json!({ "restoreKey": "different-key", "restoreCheckText": "New account" }),
+            json!({ "restoreKey": "restore-key", "restoreCheckText": null }),
+            json!({ "restoreKey": "restore-key", "restoreCheckFn": "  " }),
+            json!({ "restoreKey": null, "restoreCheckText": "New account" }),
+            json!({ "restoreKey": "", "restoreCheckText": "New account" }),
+            json!({ "restoreKey": "../bad", "restoreCheckText": "New account" }),
+            json!({ "restoreKey": "restore-key", "restoreSave": "invalid" }),
+        ] {
+            for action in ["state_checkpoint", "state_save"] {
+                let mut state = DaemonState::new();
+                state.session_name = Some("restore-key".to_string());
+                state.restore_check_text = Some("Old account".to_string());
+                state.restore_status = "loaded_but_invalid".to_string();
+                state.restore_status_detail = Some("Original failure".to_string());
+                state.restore_load_failed = true;
+                state.restore_validation_pending = true;
+                state.restore_loaded_path = Some("old.json".to_string());
+                state.restore_saved_path = Some("previous.json".to_string());
+                state.active_provider_connection = true;
+                state.active_provider_session = Some(ActiveProviderSession {
+                    session: providers::ProviderSession {
+                        provider: "checkpoint-test".to_string(),
+                        session_id: "live-session".to_string(),
+                    },
+                    plugins: Vec::new(),
+                });
+                let mut cmd = payload.clone();
+                cmd["action"] = json!(action);
+                cmd["id"] = json!("checkpoint-rejected");
+                cmd["restoreSave"] = payload
+                    .get("restoreSave")
+                    .cloned()
+                    .unwrap_or(json!("never"));
+
+                let resp = execute_command(&cmd, &mut state).await;
+
+                assert_eq!(resp["success"], false, "{cmd}: {resp}");
+                assert_eq!(state.session_name.as_deref(), Some("restore-key"));
+                assert_eq!(state.restore_check_text.as_deref(), Some("Old account"));
+                assert_eq!(state.restore_save, "auto");
+                assert_eq!(state.restore_status, "loaded_but_invalid");
+                assert_eq!(
+                    state.restore_status_detail.as_deref(),
+                    Some("Original failure")
+                );
+                assert!(state.restore_load_failed);
+                assert!(!state.restore_checkpoint_failed);
+                assert!(state.restore_validation_pending);
+                assert_eq!(state.restore_loaded_path.as_deref(), Some("old.json"));
+                assert_eq!(state.restore_saved_path.as_deref(), Some("previous.json"));
+                assert_eq!(state.restore_save_status, "not_attempted");
+                assert!(state.last_autosave_attempt.is_none());
+                assert!(state.active_provider_connection);
+                assert_eq!(
+                    state
+                        .active_provider_session
+                        .as_ref()
+                        .unwrap()
+                        .session
+                        .session_id,
+                    "live-session"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_missing_key_or_checks_does_not_apply_options_or_set_guard() {
+        for payload in [
+            json!({ "restoreCheckText": "Account" }),
+            json!({ "restoreKey": "new-key" }),
+            json!({ "restoreKey": "new-key", "restoreCheckText": null }),
+        ] {
+            let mut state = DaemonState::new();
+            let mut cmd = payload;
+            cmd["action"] = json!("state_checkpoint");
+            cmd["restoreSave"] = json!("never");
+            let resp = execute_command(&cmd, &mut state).await;
+            assert_eq!(resp["success"], false);
+            assert!(state.session_name.is_none());
+            assert!(state.restore_check_text.is_none());
+            assert_eq!(state.restore_save, "auto");
+            assert_eq!(state.restore_status, "not_configured");
+            assert!(state.restore_status_detail.is_none());
+            assert!(!state.restore_load_failed);
+            assert!(!state.restore_checkpoint_failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_changed_checks_preserve_prior_failure_and_bookkeeping() {
+        for checks in [
+            json!({ "restoreCheckText": "New account" }),
+            json!({ "restoreCheckText": null, "restoreCheckFn": "isLoggedIn()" }),
+            json!({}),
+        ] {
+            let mut state = DaemonState::new();
+            state.session_name = Some("restore-key".to_string());
+            state.restore_check_text = Some("Old account".to_string());
+            state.restore_status = "loaded_but_invalid".to_string();
+            state.restore_status_detail = Some("Original failure".to_string());
+            state.restore_load_failed = true;
+            state.restore_validation_pending = true;
+            state.restore_loaded_path = Some("old.json".to_string());
+            state.restore_saved_path = Some("previous.json".to_string());
+            let mut cmd = checks.clone();
+            cmd["id"] = json!("checkpoint-changed");
+            cmd["action"] = json!("state_checkpoint");
+            cmd["restoreKey"] = json!("restore-key");
+            cmd["restoreSave"] = json!("auto");
+
+            let resp = execute_command(&cmd, &mut state).await;
+
+            assert_eq!(resp["success"], false);
+            assert_eq!(resp["error"], "Browser not launched");
+            assert!(state.restore_checkpoint_failed);
+            assert!(state.restore_load_failed);
+            assert!(state.restore_validation_pending);
+            assert_eq!(state.restore_status, "loaded_but_invalid");
+            assert_eq!(
+                state.restore_status_detail.as_deref(),
+                Some("Original failure")
+            );
+            assert_eq!(state.restore_loaded_path.as_deref(), Some("old.json"));
+            assert_eq!(state.restore_saved_path.as_deref(), Some("previous.json"));
+            assert_eq!(state.restore_save_status, "not_attempted");
+            if checks.get("restoreCheckFn").is_some() {
+                assert!(state.restore_check_text.is_none());
+                assert_eq!(state.restore_check_fn.as_deref(), Some("isLoggedIn()"));
+            } else {
+                assert_eq!(
+                    state.restore_check_text.as_deref(),
+                    Some(if checks.get("restoreCheckText").is_some() {
+                        "New account"
+                    } else {
+                        "Old account"
+                    })
+                );
+            }
+            assert!(auto_save_restore_state(&mut state).await.unwrap().is_none());
+            assert_eq!(state.restore_save_status, "skipped_restore_failed");
+            assert_eq!(
+                state.restore_status_detail.as_deref(),
+                Some("Original failure")
+            );
+            assert!(state.restore_validation_pending);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_binds_key_in_place_and_guards_first_capture_failure() {
+        let mut state = DaemonState::new();
+        state.active_provider_connection = true;
+        state.active_provider_session = Some(ActiveProviderSession {
+            session: providers::ProviderSession {
+                provider: "checkpoint-test".to_string(),
+                session_id: "live-session".to_string(),
+            },
+            plugins: Vec::new(),
+        });
+        let resp = execute_command(
+            &json!({
+                "id": "checkpoint-bind", "action": "state_checkpoint",
+                "restoreKey": "new-key", "restoreCheckText": "Account", "restoreSave": "auto"
+            }),
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(resp["success"], false);
+        assert_eq!(resp["error"], "Browser not launched");
+        assert_eq!(state.session_name.as_deref(), Some("new-key"));
+        assert!(state.active_provider_connection);
+        assert_eq!(
+            state
+                .active_provider_session
+                .as_ref()
+                .unwrap()
+                .session
+                .session_id,
+            "live-session"
+        );
+        assert!(state.last_autosave_attempt.is_none());
+        assert!(state.restore_checkpoint_failed);
+        assert!(state.restore_load_failed);
+        assert_eq!(state.restore_status, "checkpoint_failed");
+        assert_eq!(
+            state.restore_status_detail.as_deref(),
+            Some("Checkpoint capture, validation, or write failed (sensitive details omitted)")
+        );
+        assert_eq!(state.restore_save_status, "not_attempted");
+
+        state.restore_load_failed = false;
+        state.restore_validation_pending = true;
+        assert!(auto_save_restore_state(&mut state).await.unwrap().is_none());
+        assert_eq!(state.restore_save_status, "skipped_restore_failed");
+        assert!(state.restore_validation_pending);
+        assert!(state.restore_checkpoint_failed);
+        mark_explicit_restore_checkpoint_saved(&mut state, "new.json");
+        assert!(!state.restore_checkpoint_failed);
+        assert!(!state.restore_load_failed);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_requires_nonempty_restore_key_not_session_id() {
+        for restore_key in [None, Some(String::new())] {
+            let mut state = DaemonState::new();
+            state.session_id = "named-cli-session".to_string();
+            state.session_name = restore_key;
+            let err = handle_state_save(&json!({}), &mut state).await.unwrap_err();
+            assert!(err.contains("requires a restore session"));
+            assert_eq!(state.restore_save_status, "not_attempted");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_requires_app_check_without_clearing_failure() {
+        let mut state = DaemonState::new();
+        state.session_name = Some("restore-key".to_string());
+        state.restore_load_failed = true;
+        state.restore_check_text = Some("  ".to_string());
+        let err = handle_state_checkpoint(&mut state).await.unwrap_err();
+        assert!(err.contains("app-specific"));
+        assert!(state.restore_load_failed);
+        assert_eq!(state.restore_save_status, "not_attempted");
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_without_browser_preserves_failed_restore() {
+        let mut state = DaemonState::new();
+        state.session_name = Some("restore-key".to_string());
+        state.restore_check_text = Some("Dashboard".to_string());
+        state.restore_status = "load_failed".to_string();
+        state.restore_status_detail = Some("Invalid state file".to_string());
+        state.restore_load_failed = true;
+        state.restore_validation_pending = true;
+        let err = handle_state_save(&json!({}), &mut state).await.unwrap_err();
+        assert_eq!(err, "Browser not launched");
+        assert_eq!(state.restore_status, "load_failed");
+        assert_eq!(
+            state.restore_status_detail.as_deref(),
+            Some("Invalid state file")
+        );
+        assert!(state.restore_load_failed);
+        assert!(state.restore_validation_pending);
+    }
+
+    #[test]
+    fn test_checkpoint_saved_clears_failure_without_claiming_loaded() {
+        let mut state = DaemonState::new();
+        state.restore_status = "load_failed".to_string();
+        state.restore_status_detail = Some("Invalid state file".to_string());
+        state.restore_loaded_path = Some("old.json".to_string());
+        state.restore_load_failed = true;
+        state.restore_validation_pending = true;
+        state.restore_save_status = "skipped_restore_failed".to_string();
+        mark_explicit_restore_checkpoint_saved(&mut state, "new.json");
+        assert_eq!(state.restore_status, "saved");
+        assert!(state.restore_status_detail.is_none());
+        assert_eq!(state.restore_loaded_path.as_deref(), Some("old.json"));
+        assert!(!state.restore_load_failed);
+        assert!(!state.restore_validation_pending);
+        assert_eq!(state.restore_save_status, "saved");
+        assert_eq!(state.restore_saved_path.as_deref(), Some("new.json"));
+        assert!(state.last_autosave_attempt.is_some());
+    }
+
     #[test]
     fn test_explicit_state_load_clears_restore_failure_for_auto_save() {
         let mut state = DaemonState::new();
@@ -14711,6 +15143,53 @@ mod tests {
         let actions = policy_actions_for_command(&cmd, "navigate", false);
 
         assert_eq!(actions, vec!["navigate".to_string()]);
+    }
+
+    #[test]
+    fn test_checkpoint_uses_existing_state_save_policy_action() {
+        assert!(skip_launch_action("state_checkpoint"));
+        let cmd = json!({ "action": "state_checkpoint" });
+        assert_eq!(
+            policy_actions_for_command(&cmd, "state_checkpoint", false),
+            vec!["state_save".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_obeys_state_save_deny_and_confirmation_before_launch() {
+        for (rules, requires_confirmation) in [
+            (r#"{"deny":["state_save"]}"#, false),
+            (r#"{"confirm":["state_save"]}"#, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let policy_path = dir.path().join("policy.json");
+            fs::write(&policy_path, rules).unwrap();
+            let mut state = DaemonState::new();
+            state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
+            let cmd = json!({
+                "id": "checkpoint-policy", "action": "state_checkpoint",
+                "restoreKey": "proposed-key", "restoreCheckText": "Account", "restoreSave": "never"
+            });
+
+            let resp = execute_command(&cmd, &mut state).await;
+
+            if requires_confirmation {
+                assert_eq!(resp["data"]["confirmation_required"], true);
+                assert_eq!(resp["data"]["action"], "state_save");
+                let pending = state.pending_confirmation.as_ref().unwrap();
+                assert_eq!(pending.action, "state_save");
+                assert_eq!(pending.cmd["action"], "state_checkpoint");
+            } else {
+                assert_eq!(resp["success"], false);
+                assert!(resp["error"].as_str().unwrap().contains("state_save"));
+                assert!(state.pending_confirmation.is_none());
+            }
+            assert!(state.browser.is_none());
+            assert!(state.session_name.is_none());
+            assert!(state.restore_check_text.is_none());
+            assert_eq!(state.restore_save, "auto");
+            assert!(!state.restore_checkpoint_failed);
+        }
     }
 
     #[test]
@@ -17783,6 +18262,23 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_execute_unknown_command() {
+        let keys = [
+            "AGENT_BROWSER_CDP",
+            "AGENT_BROWSER_AUTO_CONNECT",
+            "AGENT_BROWSER_PROVIDER",
+            "AGENT_BROWSER_PROFILE",
+            "AGENT_BROWSER_EXECUTABLE_PATH",
+            "AGENT_BROWSER_ENGINE",
+        ];
+        let guard = EnvGuard::new(&keys);
+        for key in keys {
+            guard.remove(key);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        guard.set(
+            "AGENT_BROWSER_EXECUTABLE_PATH",
+            temp.path().join("missing-browser").to_str().unwrap(),
+        );
         let mut state = DaemonState::new();
         let cmd = json!({ "action": "unknown_action_xyz", "id": "test-1" });
         let result = execute_command(&cmd, &mut state).await;

@@ -2,6 +2,8 @@
 
 Browser automation CLI for AI agents. Fast native Rust CLI.
 
+This personal fork, [x12315/agent-browser](https://github.com/x12315/agent-browser/tree/fix/login-session-reuse), adds verified login checkpoints and task-scoped authentication reuse on top of v0.39.1. It is not an official npm release. Installing the upstream package or only the discovery stub does not activate these changes; use a deliberately built fork binary and its matching bundled skills. Existing browser daemons are not restarted or migrated automatically.
+
 <p>
   <a href="https://vercel.com/labs#labs-products"><img alt="Vercel Labs Product" src="https://img.shields.io/badge/LABS-PRODUCT-0a0a0a.svg?style=for-the-badge&amp;logo=Vercel&amp;labelColor=000000" height="28"></a>
   <a href="https://www.npmjs.com/package/agent-browser"><img alt="npm version: agent-browser" src="https://img.shields.io/npm/v/agent-browser.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>
@@ -457,7 +459,7 @@ agent-browser errors                  # View page errors (uncaught JavaScript ex
 agent-browser errors --clear          # Clear errors
 agent-browser highlight <sel>         # Highlight element
 agent-browser inspect                 # Open Chrome DevTools for the active page
-agent-browser state save <path>       # Save auth state
+agent-browser state save [path]       # Export state, or checkpoint configured --restore session
 agent-browser state load <path>       # Load auth state
 agent-browser state list              # List saved state files
 agent-browser state show <file>       # Show state summary
@@ -666,6 +668,30 @@ agent-browser provides multiple ways to persist login sessions so you don't re-a
 | **Auth vault** | Store credentials locally (encrypted), login by name | `auth save` / `auth login` |
 
 `auth login` filters matching controls by their layout size, computed visibility and opacity, and disabled/readonly state, including custom CSS selectors. If a selected credential field is replaced or redirects focus before entry, the command fails without submitting.
+
+### Reuse an authenticated task before logging in again
+
+Keep one isolated session and restore key for the authorized task, site, and account. Derive it once; retain the nonsecret key across new shells, directory changes, context compaction, and Harness switches. Pass `--session` and `--restore` on every command instead of assuming a prior shell export still exists. A named session alone does not enable persistence.
+
+```bash
+SESSION="$(agent-browser session id --scope worktree --prefix my-app-task)"
+browser() {
+  agent-browser --session "$SESSION" --restore --restore-save auto \
+    --restore-check-url "https://app.example.com/dashboard" \
+    --restore-check-text "Signed in as my-account" "$@"
+}
+browser open https://app.example.com/dashboard
+# Inspect the existing session and verify the expected account before asking for login.
+# After the user completes login in THIS browser and the signed-in signal is verified:
+browser state save
+browser session info --json
+```
+
+Pathless `state save` immediately checkpoints the native restore store after page readiness and all configured URL/text/function checks pass. Success reports `saveStatus: "saved"`, records `restoreSavedPath`, and resumes automatic saving after a previously failed restore; failure leaves saved state and the failure guard intact. It requires a configured restore key and at least one nonempty application-specific restore check, and never invents a repository-local auth file. Retain the nonsecret key and check options together; repeat the same checks on every command, because omitting them on a later `--restore` call clears launch checks. Explicit `state save <path>` remains an export. MCP `agent_browser_state_save` has the same optional `path`; supply the stable `session` and `extraArgs: ["--restore"]` and the same `--restore-check-url`/`--restore-check-text` flags for a checkpoint.
+
+Reuse current or restored authentication before asking the user to log in again. Do not delete cookies/state, change accounts, rotate keys, or create a new session merely because navigation or verification failed. Diagnose the same session first. Expired or revoked sessions, required MFA, or an intentional account switch can genuinely require fresh login. Browser state may not cover every site's IndexedDB or server-side session behavior; use a separately authorized persistent profile when necessary rather than copying a broad personal Chrome profile.
+
+Native saved-state files are owner-private on Unix (`0600`; session directories `0700`). Encryption with an existing durable `AGENT_BROWSER_ENCRYPTION_KEY` is optional; do not generate a disposable key that makes the next restore fail. State files, encryption keys, passwords and tokens never belong in Git or model output. The checkpoint uses a distinct daemon action so an old daemon fails instead of silently applying legacy save semantics; preserve any live session and upgrade deliberately, not by forcing re-login or killing other browsers.
 
 ### Stateful auth vault login
 

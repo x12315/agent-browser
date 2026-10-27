@@ -1,409 +1,119 @@
 # Authentication Patterns
 
-Login flows, session persistence, OAuth, 2FA, and authenticated browsing.
+Login once within a task, verify the intended account, and reuse the same session. Persistence does not prevent server-side expiry, revocation, or MFA.
 
-**Related**: [session-management.md](session-management.md) for state persistence details, [SKILL.md](../SKILL.md) for quick start.
+**Related**: [session-management.md](session-management.md), [trust-boundaries.md](trust-boundaries.md), [authenticated-session.sh](../templates/authenticated-session.sh).
 
-## Contents
+## Check before asking for login
 
-- [Import Auth from Your Browser](#import-auth-from-your-browser)
-- [Persistent Profiles](#persistent-profiles)
-- [Session Persistence](#session-persistence)
-- [Basic Login Flow](#basic-login-flow)
-- [Plugins](#plugins)
-- [Saving Authentication State](#saving-authentication-state)
-- [Restoring Authentication](#restoring-authentication)
-- [OAuth / SSO Flows](#oauth--sso-flows)
-- [Two-Factor Authentication](#two-factor-authentication)
-- [HTTP Basic Auth](#http-basic-auth)
-- [Cookie-Based Auth](#cookie-based-auth)
-- [Token Refresh Handling](#token-refresh-handling)
-- [Security Best Practices](#security-best-practices)
-
-## Import Auth from Your Browser
-
-The fastest way to authenticate is to reuse cookies from a Chrome session you are already logged into.
-
-**Step 1: Start Chrome with remote debugging**
+Derive one stable task/site/account key once, using a nonsecret prefix. Record that nonsecret key, the application/account-specific validation options, and any explicitly used nonsecret namespace/engine/profile launch identity in task notes and recover them across shell, context, harness, and working-directory changes. Never copy credential values into notes. A worktree-scoped derivation can change after changing directories, so do not rerun it during the task. Never hijack the shared default or reuse another account's session.
 
 ```bash
-# macOS
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222
-
-# Linux
-google-chrome --remote-debugging-port=9222
-
-# Windows
-"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
-```
-
-Log in to your target site(s) in this Chrome window as you normally would.
-
-> **Security note:** `--remote-debugging-port` exposes full browser control on localhost. Any local process can connect and read cookies, execute JS, etc. Only use on trusted machines and close Chrome when done.
-
-**Step 2: Grab the auth state**
-
-```bash
-# Auto-discover the running Chrome and save its cookies + localStorage
-agent-browser --auto-connect state save ./my-auth.json
-```
-
-**Step 3: Reuse in automation**
-
-```bash
-# Load auth at launch
-agent-browser --state ./my-auth.json open https://app.example.com/dashboard
-
-# Or load into an already-launched session
-agent-browser open about:blank
-agent-browser state load ./my-auth.json
-agent-browser open https://app.example.com/dashboard
-```
-
-This works for any site, including those with complex OAuth flows, SSO, or 2FA, as long as Chrome already has valid session cookies.
-
-> **Security note:** State files contain session tokens in plaintext. Add them to `.gitignore`, delete when no longer needed, and set `AGENT_BROWSER_ENCRYPTION_KEY` for encryption at rest. See [Security Best Practices](#security-best-practices).
-
-**Tip:** Combine with `--session <id> --restore` so the imported auth auto-persists across restarts:
-
-```bash
-SESSION="$(agent-browser session id --scope worktree --prefix myapp)"
-agent-browser --session "$SESSION" --restore --state ./my-auth.json open https://app.example.com/dashboard
-# From now on, state is auto-saved/restored for this session
-```
-
-## Persistent Profiles
-
-Use `--profile` to point agent-browser at a Chrome user data directory. This persists everything (cookies, IndexedDB, service workers, cache) across browser restarts without explicit save/load:
-
-```bash
-# First run: login once
-agent-browser --profile ~/.myapp-profile open https://app.example.com/login
-# ... complete login flow ...
-
-# All subsequent runs: already authenticated
-agent-browser --profile ~/.myapp-profile open https://app.example.com/dashboard
-```
-
-Use different paths for different projects or test users:
-
-```bash
-agent-browser --profile ~/.profiles/admin open https://app.example.com
-agent-browser --profile ~/.profiles/viewer open https://app.example.com
-```
-
-Or set via environment variable:
-
-```bash
-export AGENT_BROWSER_PROFILE=~/.myapp-profile
-agent-browser open https://app.example.com/dashboard
-```
-
-## Session Persistence
-
-Use `--restore` with a stable `--session` to auto-save and restore cookies + localStorage without managing files:
-
-```bash
-# Auto-saves state on close, auto-restores on next launch
-SESSION="$(agent-browser session id --scope worktree --prefix twitter)"
-agent-browser --session "$SESSION" --restore open https://twitter.com
-# ... login flow ...
-agent-browser --session "$SESSION" --restore close  # state saved to ~/.agent-browser/sessions/
-
-# Next time: state is automatically restored
-agent-browser --session "$SESSION" --restore open https://twitter.com
-```
-
-Encrypt state at rest:
-
-```bash
-export AGENT_BROWSER_ENCRYPTION_KEY=$(openssl rand -hex 32)
-agent-browser --session secure --restore open https://app.example.com
-```
-
-## Basic Login Flow
-
-```bash
-# Navigate to login page
-agent-browser open https://app.example.com/login
-agent-browser wait --load domcontentloaded
-agent-browser wait --fn "(() => { const usable = (el) => { const style = getComputedStyle(el); return !el.disabled && !el.readOnly && style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length > 0; }; const username = Array.from(document.querySelectorAll('input[type=email], input[type=text], input[autocomplete=username], input[name*=email i], input[name*=user i], input[name*=login i]')).some(usable); const password = Array.from(document.querySelectorAll('input[type=password]')).some(usable); return username && password; })()"
-
-# Get form elements
-agent-browser snapshot -i
-# Output: @e1 [input type="email"], @e2 [input type="password"], @e3 [button] "Sign In"
-
-# Fill credentials
-agent-browser fill @e1 "user@example.com"
-agent-browser fill @e2 "password123"
-
-# Submit
-agent-browser click @e3
-agent-browser wait --url "**/dashboard"
-
-# Verify login succeeded
-agent-browser get url  # Should be dashboard, not login
-```
-
-After submitting, wait for the authenticated destination, a success message, or another app-specific condition. Do not use `networkidle` as a generic login wait because long-lived background connections can keep it from resolving.
-
-`auth login` filters matching controls by their layout size, computed visibility and opacity, and disabled/readonly state, including custom CSS selectors. If a selected credential field is replaced or redirects focus before entry, the command fails without submitting.
-
-For a form reached through an in-page click, challenge clearance, consent dismissal, or another stateful step, use the auth vault without discarding the prepared document:
-
-```bash
-agent-browser open https://app.example.com/
-agent-browser click "a[href='/login']"
-agent-browser auth login my-app --no-navigate
-```
-
-`--no-navigate` suppresses only the initial navigation that `auth login` normally performs. An existing active top-level HTTP(S) page is required. Before either credential is filled, agent-browser compares the page origin with the effective credential URL using scheme, host, and effective port. Paths, queries, and fragments may differ. Selector waits, credential filling, submit clicking, and submit-triggered navigation remain unchanged.
-
-The command-level `--url` override takes precedence over stored profile or credential-provider URL metadata. In no-navigation mode it is an expected-origin constraint, not a navigation destination. This supports hosted identity-provider flows:
-
-```bash
-agent-browser auth login work --no-navigate --url https://identity.example.com/login
-```
-
-## Plugins
-
-Use credential provider plugins when credentials live in external vault software. Plugins are configured in `agent-browser.json` and run as external executables over the `agent-browser.plugin.v1` stdio JSON protocol.
-
-Add a plugin with `plugin add`. A plain `name` or `@scope/name` resolves from npm; `owner/repo` resolves from GitHub:
-
-```bash
-agent-browser plugin add agent-browser-plugin-vault --name vault
-agent-browser plugin add @company/agent-browser-plugin-vault --name vault
-agent-browser plugin add org/agent-browser-plugin-cloud-browser
-```
-
-```json
-{
-  "plugins": [
-    {
-      "name": "vault",
-      "command": "agent-browser-plugin-vault",
-      "capabilities": ["credential.read"]
-    },
-    {
-      "name": "cloud-browser",
-      "command": "agent-browser-plugin-cloud-browser",
-      "capabilities": ["browser.provider"]
-    },
-    {
-      "name": "stealth",
-      "command": "agent-browser-plugin-stealth",
-      "capabilities": ["launch.mutate"]
-    },
-    {
-      "name": "captcha",
-      "command": "agent-browser-plugin-captcha",
-      "capabilities": ["command.run", "captcha.solve"]
-    }
-  ]
+# Once at task start, not on every invocation
+SESSION="$(agent-browser session id --scope worktree --prefix task-myapp-work)"
+export AGENT_BROWSER_SESSION="$SESSION"
+export AGENT_BROWSER_RESTORE="$SESSION"
+# Recreate this helper in each shell using the options retained in task notes.
+browser() {
+    agent-browser --session "$SESSION" --restore --restore-save auto \
+        --restore-check-url "https://app.example.com/dashboard" \
+        --restore-check-text "Work account dashboard" "$@"
 }
+browser session info --json
+browser open https://app.example.com/dashboard
+browser wait --load domcontentloaded
+browser wait --url "https://app.example.com/dashboard"
+browser wait --text "Work account dashboard"
 ```
 
-Inspect configured plugins before use:
+Use a nonsecret application/account-specific signal, not just the absence of a login URL. If the current or restored session is authenticated as the intended account, continue the task without another login. A timeout or navigation failure alone is not proof of expiry: inspect session/restore status and the page before asking the user to authenticate.
+
+Pass the explicit session, restore, and same full validation flags on every command, including `state save` and close, as the helper does. Validation flags are not sticky across CLI calls: omitting them on a later `--restore` call clears the checks supplied at launch. Environment variables and shell helpers may not survive shell or harness changes; recreate the helper from the nonsecret task record.
+
+## Manual login and immediate checkpoint
+
+If login is genuinely needed, leave the SAME browser open and let the user complete login, SSO, or MFA there. Use its dashboard if the session is headless. Do not accept passwords or tokens as command-line arguments, print them, or extract them with page JavaScript. After the user finishes, preserve the current page and verify the app and intended account:
 
 ```bash
-agent-browser plugin list
-agent-browser plugin show vault
+# Use the browser helper above with the SAME checks on every invocation.
+browser wait --load domcontentloaded
+browser wait --url "https://app.example.com/dashboard"
+browser wait --text "Work account dashboard"
+browser state save
 ```
 
-Resolve credentials just-in-time for one login:
+Pathless `state save` writes an explicit checkpoint to the native private restore store. No encryption key is required: on Unix, owner-private directories (0700) and files (0600) protect plaintext state by default. Windows inherits the destination's ACLs; use trusted private user storage. Optional `AGENT_BROWSER_ENCRYPTION_KEY` encryption should reuse a durable existing 64-hex-character key from trusted local secret storage. Reject a malformed supplied key without printing it; never generate or rotate keys or passwords, or use a per-run random key. A missing key is not a reason to request login, reconstruct authentication, or export cookies. The native command requires a ready page and at least one nonempty application-specific `--restore-check-url`, `--restore-check-text`, or `--restore-check-fn`, and verifies every supplied check before saving. Missing checks are an error; readiness alone must not save a generic login page. A failed check/save preserves the previous checkpoint and does not clear a prior restore-failure autosave block. Only a successful checkpoint clears that block. Do not wait 30 seconds for autosave after login or change `--restore-save auto` globally to `always`.
+
+Use [authenticated-session.sh](../templates/authenticated-session.sh) for a small executable workflow:
 
 ```bash
-agent-browser auth login my-app --credential-provider vault --item "My App"
+# AGENT_BROWSER_SESSION must be set; an existing encryption key is optional
+./authenticated-session.sh https://app.example.com/dashboard "Work account dashboard"
+# If verification needs attention, it exits 2 and leaves the same browser open.
+# After manual login, checkpoint without navigating away:
+./authenticated-session.sh https://app.example.com/dashboard "Work account dashboard" --checkpoint
 ```
 
-After stateful setup, combine the provider with no-navigation mode. The provider secret remains in memory and does not enter generated process arguments or normal output:
+The template does not log credentials, export plaintext state to the repository, clear cookies, delete old state, or close any session. Normal mode navigates to the protected target first; checkpoint mode preserves the current page after manual login. Both modes verify readiness, URL and account text, then call native pathless `state save` exactly once to save refreshed authentication. A failed check or save exits with failure without retrying, closing the browser, or deleting saved state.
+
+## Auth vault and credential providers
+
+For an authorized automated login, use an existing auth vault entry or configured credential-provider plugin rather than secret arguments. Check current/restored authentication first. Have the user provision credentials using the secure vault input workflow outside agent logs.
 
 ```bash
-agent-browser auth login my-app --credential-provider vault --item "My App" --no-navigate --url https://identity.example.com/login
+browser auth login my-app
 ```
 
-Use a plugin as a browser provider or a generic domain command:
+`auth login` filters matching controls by layout size, computed visibility and opacity, and disabled/readonly state, including custom CSS selectors. If a selected credential field is replaced or redirects focus before entry, it fails without submitting. After submission, verify the account and checkpoint as above; form submission alone does not prove successful authentication.
+
+For a form reached through an in-page click, challenge clearance, or consent dismissal, preserve the prepared document:
 
 ```bash
-agent-browser --provider cloud-browser open https://example.com
-agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"...","url":"https://example.com"}'
+browser open https://app.example.com/
+browser click "a[href='/login']"
+browser auth login my-app --no-navigate
 ```
 
-`plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths.
-
-Use `--url`, `--username-selector`, `--password-selector`, and `--submit-selector` on `auth login` to override plugin-provided metadata for the current login only.
-
-Gate plugin secret access separately from normal login automation:
+`--no-navigate` suppresses only the initial navigation. It requires an active top-level HTTP(S) page and compares the page origin with the effective credential URL using scheme, host, and effective port before filling credentials. Paths, queries, and fragments may differ. Selector waits, filling, submission, and submit-triggered navigation remain unchanged. A command-level `--url` overrides stored or provider URL metadata and becomes the expected-origin constraint:
 
 ```bash
-agent-browser --confirm-actions plugin:vault:credential.read auth login my-app --credential-provider vault --item "My App"
-agent-browser --confirm-actions plugin:cloud-browser:browser.provider --provider cloud-browser open https://example.com
-agent-browser --confirm-actions plugin:stealth:launch.mutate open https://example.com
+browser auth login work --no-navigate --url https://identity.example.com/login
 ```
 
-Do not put vault tokens or passwords in plugin command args. Use the vault vendor's own login/session mechanism or environment outside agent-browser config.
-
-## Saving Authentication State
-
-After logging in, save state for reuse:
+Credential-provider plugins are external executables configured in `agent-browser.json` using the `agent-browser.plugin.v1` stdio JSON protocol. Inspect the configured plugin before granting secret access:
 
 ```bash
-# Login first (see above)
-agent-browser open https://app.example.com/login
-agent-browser snapshot -i
-agent-browser fill @e1 "user@example.com"
-agent-browser fill @e2 "password123"
-agent-browser click @e3
-agent-browser wait --url "**/dashboard"
-
-# Save authenticated state
-agent-browser state save ./auth-state.json
+browser plugin list
+browser plugin show vault
+browser auth login my-app --credential-provider vault --item "My App"
+browser auth login my-app --credential-provider vault --item "My App" --no-navigate --url https://identity.example.com/login
+browser --confirm-actions plugin:vault:credential.read auth login my-app --credential-provider vault --item "My App"
 ```
 
-## Restoring Authentication
+Use `--url`, `--username-selector`, `--password-selector`, and `--submit-selector` to override provider metadata for that login. Provider secrets remain in memory rather than generated process arguments or normal output. Never put vault tokens or passwords in plugin arguments or repository config. Use the vault vendor's local login/session mechanism.
 
-Skip login by loading saved state:
+## Restarts, expiry, and account changes
 
 ```bash
-# Load saved auth state
-agent-browser state load ./auth-state.json
-
-# Navigate directly to protected page
-agent-browser open https://app.example.com/dashboard
-
-# Verify authenticated
-agent-browser snapshot -i
+# Routine close preserves configured persistence; never clear auth as cleanup.
+browser close
+# Later, recover the SAME key and checks; recreate the helper before reuse.
+browser open https://app.example.com/dashboard
 ```
 
-## OAuth / SSO Flows
+Allow the application to refresh its own tokens. Do not read or print raw cookies/localStorage tokens to decide whether authentication works. Test the protected application and intended account instead. Server expiry, revocation, MFA policy, or an intentional account switch can genuinely require login; explain the observed reason. Use a distinct task/site/account key for another account rather than silently replacing an unrelated session.
 
-For OAuth redirects:
+Routine close, idle timeout, navigation failure, or a failed restore is not authorization to clear cookies, delete saved authentication, or launch repeated login attempts. Preserve the previous checkpoint and investigate the failure.
 
-```bash
-# Start OAuth flow
-agent-browser open https://app.example.com/auth/google
+## Explicit imports and portable files
 
-# Handle redirects automatically
-agent-browser wait --url "**/accounts.google.com**"
-agent-browser snapshot -i
+Prefer native session restore over importing cookies or copying a broad Chrome profile. Attach to an existing browser or import a narrowly scoped file only when explicitly needed and authorized for the task; attached tabs can share cookies with the user's browser. Remote debugging grants full browser control to local clients.
 
-# Fill Google credentials
-agent-browser fill @e1 "user@gmail.com"
-agent-browser click @e2  # Next button
-agent-browser wait 2000
-agent-browser snapshot -i
-agent-browser fill @e3 "password"
-agent-browser click @e4  # Sign in
+Explicit `state save <path>`, `state load <path>`, and `--state <path>` remain portable-file operations. Unlike pathless checkpointing, they require managing a sensitive file. Keep it outside the repository, protect access, and never print or commit its contents. Do not ask the user to paste DevTools cURL requests, bearer tokens, or cookie dumps into chat or logs. A native restore checkpoint avoids these exports for normal session reuse.
 
-# Wait for redirect back
-agent-browser wait --url "**/app.example.com**"
-agent-browser state save ./oauth-state.json
-```
+## Security best practices
 
-## Two-Factor Authentication
-
-Handle 2FA with manual intervention:
-
-```bash
-# Login with credentials
-agent-browser open https://app.example.com/login --headed  # Show browser
-agent-browser snapshot -i
-agent-browser fill @e1 "user@example.com"
-agent-browser fill @e2 "password123"
-agent-browser click @e3
-
-# Wait for user to complete 2FA manually
-echo "Complete 2FA in the browser window..."
-agent-browser wait --url "**/dashboard" --timeout 120000
-
-# Save state after 2FA
-agent-browser state save ./2fa-state.json
-```
-
-## HTTP Basic Auth
-
-For sites using HTTP Basic Authentication:
-
-```bash
-# Set credentials before navigation
-agent-browser set credentials username password
-
-# Navigate to protected resource
-agent-browser open https://protected.example.com/api
-```
-
-The credentials also apply to tabs opened later through `tab new` or `click --new-tab`, including their first document request.
-
-## Cookie-Based Auth
-
-Manually set authentication cookies:
-
-```bash
-# Set auth cookie
-agent-browser cookies set session_token "abc123xyz"
-
-# Navigate to protected page
-agent-browser open https://app.example.com/dashboard
-```
-
-## Token Refresh Handling
-
-For sessions with expiring tokens:
-
-```bash
-#!/bin/bash
-# Wrapper that handles token refresh
-
-STATE_FILE="./auth-state.json"
-
-# Try loading existing state
-if [[ -f "$STATE_FILE" ]]; then
-    agent-browser state load "$STATE_FILE"
-    agent-browser open https://app.example.com/dashboard
-
-    # Check if session is still valid
-    URL=$(agent-browser get url)
-    if [[ "$URL" == *"/login"* ]]; then
-        echo "Session expired, re-authenticating..."
-        # Perform fresh login
-        agent-browser snapshot -i
-        agent-browser fill @e1 "$USERNAME"
-        agent-browser fill @e2 "$PASSWORD"
-        agent-browser click @e3
-        agent-browser wait --url "**/dashboard"
-        agent-browser state save "$STATE_FILE"
-    fi
-else
-    # First-time login
-    agent-browser open https://app.example.com/login
-    # ... login flow ...
-fi
-```
-
-## Security Best Practices
-
-1. **Never commit state files** - They contain session tokens
-   ```bash
-   echo "*.auth-state.json" >> .gitignore
-   ```
-
-2. **Use environment variables for credentials**
-   ```bash
-   agent-browser fill @e1 "$APP_USERNAME"
-   agent-browser fill @e2 "$APP_PASSWORD"
-   ```
-
-3. **Clean up after automation**
-   ```bash
-   agent-browser cookies clear
-   rm -f ./auth-state.json
-   ```
-
-4. **Use short-lived sessions for CI/CD**
-   ```bash
-   # Don't persist state in CI
-   agent-browser open https://app.example.com/login
-   # ... login and perform actions ...
-   agent-browser close  # Session ends, nothing persisted
-   ```
+- Keep raw cookies, tokens, credentials, portable state files, and encryption keys out of Git, logs, transcripts, screenshots, and task notes. Record only the nonsecret session key, application/account-specific validation options, and any explicitly used nonsecret namespace/engine/profile launch identity.
+- Use the native private store as the baseline. For optional encryption, reuse a durable trusted existing key; never generate or rotate keys or passwords, or use a per-run random key. Reject malformed supplied keys without printing them.
+- Preserve authentication on routine failures and normal close. Delete or revoke it only for an explicit cleanup/logout request or a known retention policy, not as a retry strategy.
+- Verify application and account identity after login and restore. Persistence is not a promise that tokens never expire.

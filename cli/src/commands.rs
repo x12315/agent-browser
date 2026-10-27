@@ -1803,11 +1803,13 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             const VALID: &[&str] = &["save", "load", "list", "clear", "show", "clean", "rename"];
             match rest.first().copied() {
                 Some("save") => {
-                    let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
-                        context: "state save".to_string(),
-                        usage: "state save <path>",
-                    })?;
-                    Ok(json!({ "id": id, "action": "state_save", "path": path }))
+                    if let Some(path) = rest.get(1) {
+                        Ok(json!({ "id": id, "action": "state_save", "path": path }))
+                    } else {
+                        // Old daemons accept pathless state_save without checkpoint
+                        // guarantees. A distinct action makes them fail closed.
+                        Ok(json!({ "id": id, "action": "state_checkpoint" }))
+                    }
                 }
                 Some("load") => {
                     let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
@@ -3664,6 +3666,25 @@ mod tests {
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn test_state_save_without_path_uses_distinct_checkpoint_action() {
+        let cmd = parse_command(&args("state save"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "state_checkpoint");
+        assert!(cmd.get("path").is_none());
+    }
+
+    #[test]
+    fn test_state_save_with_explicit_path() {
+        let cmd = parse_command(&args("state save auth.json"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "state_save");
+        assert_eq!(cmd["path"], "auth.json");
+    }
+
+    #[test]
+    fn test_state_load_still_requires_path() {
+        assert!(parse_command(&args("state load"), &default_flags()).is_err());
     }
 
     // === Cookies Tests ===

@@ -1,5 +1,91 @@
 {
   "pages": {
+    "/sessions": [
+      {
+        "from": "The simplest way to reuse your existing login state: pass a Chrome profile name to",
+        "to": "For an explicitly authorized profile snapshot, pass a Chrome profile name to"
+      },
+      {
+        "from": "and launches Chrome with your existing cookies and sessions.",
+        "to": "and launches Chrome with its cookies and sessions. This can include unrelated sites and accounts; prefer a task/site/account-specific named session with native restore for routine authenticated work rather than copying a broad profile."
+      },
+      {
+        "from": "If you are already logged in to a site in Chrome, you can grab that auth state and reuse it in agent-browser. This is the fastest way to bypass login flows, OAuth, SSO, or 2FA.",
+        "to": "Prefer reusing your task's current or restored session before requesting login or exporting authentication. Import from Chrome only when explicitly needed and authorized; do not extract raw tokens or request DevTools cURL dumps as the default workflow. The portable-file example below requires protecting the export outside the repository."
+      },
+      {
+        "from": "agent-browser --auto-connect state save ./my-auth.json",
+        "to": "agent-browser --session \"$SESSION\" --auto-connect state save \"$PRIVATE_AUTH_FILE\""
+      },
+      {
+        "from": "# Load auth at launch\nagent-browser --state ./my-auth.json open https://app.example.com/dashboard",
+        "to": "# Load auth at launch, with the same app/account checks on every call\nagent-browser --session \"$SESSION\" --restore --restore-check-url \"https://app.example.com/dashboard\" --restore-check-text \"Work account dashboard\" --state \"$PRIVATE_AUTH_FILE\" open https://app.example.com/dashboard"
+      },
+      {
+        "from": "agent-browser open about:blank\nagent-browser state load ./my-auth.json\nagent-browser open https://app.example.com/dashboard",
+        "to": "agent-browser --session \"$SESSION\" --restore --restore-check-url \"https://app.example.com/dashboard\" --restore-check-text \"Work account dashboard\" open about:blank\nagent-browser --session \"$SESSION\" --restore --restore-check-url \"https://app.example.com/dashboard\" --restore-check-text \"Work account dashboard\" state load \"$PRIVATE_AUTH_FILE\"\nagent-browser --session \"$SESSION\" --restore --restore-check-url \"https://app.example.com/dashboard\" --restore-check-text \"Work account dashboard\" open https://app.example.com/dashboard"
+      },
+      {
+        "from": "SESSION=\"$(agent-browser session id --scope worktree --prefix myapp)\"\nagent-browser --session \"$SESSION\" --restore --state ./my-auth.json open https://app.example.com/dashboard",
+        "to": "# Recover the same SESSION key and checks; PRIVATE_AUTH_FILE is outside Git.\nagent-browser --session \"$SESSION\" --restore --restore-check-url \"https://app.example.com/dashboard\" --restore-check-text \"Work account dashboard\" --state \"$PRIVATE_AUTH_FILE\" open https://app.example.com/dashboard"
+      },
+      {
+        "from": "State files contain session tokens in plaintext. Add them to `.gitignore` and delete when no longer needed.",
+        "to": "Set `PRIVATE_AUTH_FILE` to an access-protected path outside the repository before exporting. State files contain session tokens and are plaintext without encryption; never put raw cookies, tokens, or state contents in Git or logs. Remove portable exports only when no longer needed under your explicit cleanup policy, not as error recovery."
+      },
+      {
+        "from": "State files contain session tokens in plaintext. Add them to .gitignore and delete when no longer needed.",
+        "to": "Set PRIVATE_AUTH_FILE to an access-protected path outside the repository before exporting. State files contain session tokens and are plaintext without encryption; never put raw cookies, tokens, or state contents in Git or logs. Remove portable exports only when no longer needed under your explicit cleanup policy, not as error recovery."
+      },
+      {
+        "from": "```bash\n# Auto-save/load state for this worktree\nSESSION=\"$(agent-browser session id --scope worktree --prefix twitter)\"\nagent-browser --session \"$SESSION\" --restore open twitter.com\n\n# Login once, then state persists automatically\nagent-browser --session \"$SESSION\" --restore click \"#login\"\n\n# Optional validation prevents a bad restore from overwriting the previous good state\nagent-browser --session \"$SESSION\" --restore --restore-check-text Dashboard open twitter.com\n```",
+        "to": "```bash\n# Derive ONCE for this task/site/account, not once per shell invocation.\nSESSION=\"$(agent-browser session id --scope worktree --prefix task-myapp-work)\"\n# Recreate this helper in each shell from the nonsecret task record.\nbrowser() {\n    agent-browser --session \"$SESSION\" --restore --restore-save auto \\\n        --restore-check-url \"https://app.example.com/dashboard\" \\\n        --restore-check-text \"Work account dashboard\" \"$@\"\n}\nbrowser session info --json\nbrowser open https://app.example.com/dashboard\nbrowser wait --url \"https://app.example.com/dashboard\"\nbrowser wait --text \"Work account dashboard\"\n```"
+      },
+      {
+        "from": "# Auto-save/load state for this worktree SESSION=\"$(agent-browser session id --scope worktree --prefix twitter)\" agent-browser --session \"$SESSION\" --restore open twitter.com # Login once, then state persists automatically agent-browser --session \"$SESSION\" --restore click \"#login\" # Optional validation prevents a bad restore from overwriting the previous good state agent-browser --session \"$SESSION\" --restore --restore-check-text Dashboard open twitter.com",
+        "to": "# Derive ONCE for this task/site/account, not once per shell invocation. SESSION=\"$(agent-browser session id --scope worktree --prefix task-myapp-work)\" export AGENT_BROWSER_SESSION=\"$SESSION\" export AGENT_BROWSER_RESTORE=\"$SESSION\" # Recreate this helper in each shell from the nonsecret task record. browser() { agent-browser --session \"$SESSION\" --restore --restore-save auto \\ --restore-check-url \"https://app.example.com/dashboard\" \\ --restore-check-text \"Work account dashboard\" \"$@\" } browser session info --json browser open https://app.example.com/dashboard browser wait --url \"https://app.example.com/dashboard\" browser wait --text \"Work account dashboard\""
+      },
+      {
+        "from": "With the default `--restore-save auto` policy, failed restore or failed validation skips auto-save.",
+        "to": "With the default `--restore-save auto` policy, failed restore or failed validation skips auto-save. Keep this default rather than changing the global policy to `always`."
+      },
+      {
+        "from": "With the default --restore-save auto policy, failed restore or failed validation skips auto-save.",
+        "to": "With the default --restore-save auto policy, failed restore or failed validation skips auto-save. Keep this default rather than changing the global policy to always."
+      },
+      {
+        "from": "Encrypt saved state files (cookies, localStorage) using AES-256-GCM:\n\n```bash",
+        "to": "Encryption is optional; native private persistence works without a key. To encrypt saved state files (cookies, localStorage) using AES-256-GCM, reuse a durable existing 64-hex-character `AGENT_BROWSER_ENCRYPTION_KEY` from trusted local secret storage. Reject malformed supplied keys without printing them. Never generate or rotate keys or passwords, or use a per-run random key. Existing encrypted state still needs its original key; preserve it and recover that key rather than replacing state or requesting login.\n\n```bash"
+      },
+      {
+        "from": "Encrypt saved state files (cookies, localStorage) using AES-256-GCM:",
+        "to": "Encryption is optional; native private persistence works without a key. To encrypt saved state files (cookies, localStorage) using AES-256-GCM, reuse a durable existing 64-hex-character AGENT_BROWSER_ENCRYPTION_KEY from trusted local secret storage. Reject malformed supplied keys without printing them. Never generate or rotate keys or passwords, or use a per-run random key. Existing encrypted state still needs its original key; preserve it and recover that key rather than replacing state or requesting login."
+      },
+      {
+        "from": "# Generate a 256-bit key (64 hex characters)\nopenssl rand -hex 32\n\n# Set the encryption key",
+        "to": "# Reuse the durable existing 64-hex-character key from trusted local secret storage.\n# Configure AGENT_BROWSER_ENCRYPTION_KEY outside command logs and Git.\n# Do not generate a new random key on each invocation."
+      },
+      {
+        "from": "export AGENT_BROWSER_ENCRYPTION_KEY=<your-64-char-hex-key>\n",
+        "to": ""
+      },
+      {
+        "from": "# State files are now encrypted automatically\nagent-browser --session secure-session --restore open example.com",
+        "to": "# State files are now encrypted automatically; retain the SAME checks.\n# Use the browser helper from Session persistence above.\nbrowser open https://app.example.com/dashboard"
+      },
+      {
+        "from": "# List states shows encryption status\nagent-browser state list",
+        "to": "# List states shows encryption status\nbrowser state list"
+      },
+      {
+        "from": "# Manual save/load (for custom paths)",
+        "to": "# Explicit native checkpoint with the same checks as every other restore call\nagent-browser --session \"$SESSION\" --restore --restore-check-url \"https://app.example.com/dashboard\" --restore-check-text \"Work account dashboard\" state save\n\n# Manual save/load (for custom paths; keep exports outside Git)"
+      },
+      {
+        "from": "64-char hex key for AES-256-GCM encryption",
+        "to": "Optional existing 64-char hex key for AES-256-GCM encryption"
+      }
+    ],
     "/commands": [
       {
         "from": "# Trust a CA for locally launched Chromium on Linux",

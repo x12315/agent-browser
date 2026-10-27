@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import { test } from "node:test";
+import { evaluate } from "@mdx-js/mdx";
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import * as runtime from "react/jsx-runtime";
 import { navigation } from "../src/lib/docs-navigation.ts";
 import {
   baseline,
@@ -10,6 +14,8 @@ import {
   assertModernMarkdown,
   assertContainsLines,
   currentPages,
+  normalize,
+  text,
   absoluteDestination,
   imageSourceUrls,
   assertOriginalResource,
@@ -224,6 +230,52 @@ test("intentional docs edits apply to the live floor without touching the pinned
   assert.ok(original.modernMarkdown.includes(before));
   assert.ok(!current.modernMarkdown.includes(before));
   assert.ok(current.content.some((sample) => sample.includes("where Chromium already uses the operating system trust store")));
+});
+
+test("sessions auth reuse has explicit edits, preserves the pinned contract and documents native checkpoints", async () => {
+  const [edits, pinned, source] = await Promise.all([
+    readFile(new URL("fixtures/docs-edits.json", import.meta.url), "utf8").then(JSON.parse),
+    readFile(new URL("fixtures/docs-baseline.json", import.meta.url), "utf8").then(JSON.parse),
+    readFile(new URL("../content/docs/sessions.mdx", import.meta.url), "utf8"),
+  ]);
+  const original = pages.find((page) => page.path === "/sessions");
+  const current = currentPages.find((page) => page.path === "/sessions");
+  assert.deepEqual(original, pinned.pages.find((page) => page.path === "/sessions"));
+  assert.ok(original.modernMarkdown.includes("The simplest way to reuse your existing login state"));
+  assert.ok(original.modernMarkdown.includes("openssl rand -hex 32"));
+  assert.notEqual(current.modernMarkdown, original.modernMarkdown);
+  for (const key of Object.keys(original).filter(
+    (key) => !["content", "modernMarkdown", "legacyMarkdown"].includes(key),
+  ))
+    assert.deepEqual(current[key], original[key], `sessions preserves ${key}`);
+  assert.ok(edits.pages["/sessions"].length > 0);
+  for (const { from, to } of edits.pages["/sessions"]) {
+    assert.ok(from.length > 0);
+    assert.ok(
+      [original.modernMarkdown, original.legacyMarkdown, ...original.content]
+        .some((value) => normalize(value).includes(normalize(from))),
+      `explicit sessions edit must target original content: ${from}`,
+    );
+    assert.equal(typeof to, "string");
+  }
+  const body = source.replace(/^---\n[\s\S]*?\n---\n/, "");
+  const markdown = `# Sessions\n${body}`;
+  for (const key of ["modernMarkdown", "legacyMarkdown"])
+    assertContainsLines(markdown, current[key], `sessions ${key} intentional floor`);
+  const { default: Content } = await evaluate(body, runtime);
+  const visible = text(renderToStaticMarkup(React.createElement(Content)));
+  for (const sample of current.content)
+    assert.ok(visible.includes(normalize(sample)), `sessions content floor: ${sample}`);
+  for (const content of [
+    "### Checkpoint immediately after login",
+    "browser state save",
+    "Checks are not sticky across CLI calls",
+    "Only a successful checkpoint clears a prior restore-failure autosave block",
+    "A failed check or save returns failure without retrying, closing the browser, or deleting saved state.",
+    'export AGENT_BROWSER_SESSION="$SESSION"',
+    'export AGENT_BROWSER_RESTORE="$SESSION"',
+  ])
+    assert.ok(source.includes(content), `sessions retains core auth guidance: ${content}`);
 });
 
 test("link normalization preserves origin, path, query and fragment destinations", () => {

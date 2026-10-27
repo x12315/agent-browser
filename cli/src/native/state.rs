@@ -5,7 +5,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -85,12 +86,64 @@ fn parse_origin_storage(data: &Value) -> Option<OriginStorage> {
     })
 }
 
-/// Evaluate the storage-collection JS snippet and parse the result.
+fn parse_storage_capture(
+    result: super::cdp::types::EvaluateResult,
+    strict: bool,
+) -> Result<Option<OriginStorage>, String> {
+    let data = result.result.value.unwrap_or(Value::Null);
+    if !strict {
+        return Ok(parse_origin_storage(&data));
+    }
+    let capture_error = || "Failed to capture origin storage".to_string();
+    if result.exception_details.is_some()
+        || data.get("captureFailed").and_then(Value::as_bool) != Some(false)
+    {
+        return Err(capture_error());
+    }
+    let origin = data
+        .get("origin")
+        .and_then(Value::as_str)
+        .ok_or_else(capture_error)?;
+    let local_storage: Vec<StorageEntry> = serde_json::from_value(
+        data.get("localStorage")
+            .cloned()
+            .ok_or_else(capture_error)?,
+    )
+    .map_err(|_| capture_error())?;
+    let session_storage: Vec<StorageEntry> = serde_json::from_value(
+        data.get("sessionStorage")
+            .cloned()
+            .ok_or_else(capture_error)?,
+    )
+    .map_err(|_| capture_error())?;
+    if origin == "null" {
+        return Ok(None);
+    }
+    if origin.is_empty() || url::Url::parse(origin).is_err() {
+        return Err(capture_error());
+    }
+    Ok(Some(OriginStorage {
+        origin: origin.to_string(),
+        local_storage,
+        session_storage,
+    }))
+}
+
+fn storage_capture_result<T>(result: Result<T, String>, strict: bool) -> Result<Option<T>, String> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(_) if strict => Err("Failed to capture browser storage".to_string()),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Evaluate storage without exposing page exception messages in capture errors.
 async fn eval_origin_storage(
     client: &CdpClient,
     session_id: &str,
     origin_js: &str,
-) -> Option<OriginStorage> {
+    strict: bool,
+) -> Result<Option<OriginStorage>, String> {
     let result = client
         .send_command_typed::<_, super::cdp::types::EvaluateResult>(
             "Runtime.evaluate",
@@ -101,10 +154,11 @@ async fn eval_origin_storage(
             },
             Some(session_id),
         )
-        .await
-        .ok()?;
-    let data = result.result.value.unwrap_or(Value::Null);
-    parse_origin_storage(&data)
+        .await;
+    match storage_capture_result(result, strict)? {
+        Some(result) => parse_storage_capture(result, strict),
+        None => Ok(None),
+    }
 }
 
 /// Create a temporary CDP target, navigate it to each origin to collect localStorage,
@@ -114,6 +168,7 @@ async fn collect_storage_via_temp_target(
     client: &CdpClient,
     origins: &[String],
     origin_js: &str,
+    strict: bool,
 ) -> Result<Vec<OriginStorage>, String> {
     let create_result: CreateTargetResult = client
         .send_command_typed(
@@ -128,7 +183,7 @@ async fn collect_storage_via_temp_target(
     let target_id = create_result.target_id;
 
     // Ensure the target is closed even if attach or later steps fail
-    let result = collect_storage_in_target(client, &target_id, origins, origin_js).await;
+    let result = collect_storage_in_target(client, &target_id, origins, origin_js, strict).await;
 
     let _ = client
         .send_command_typed::<_, Value>(
@@ -146,6 +201,7 @@ async fn collect_storage_in_target(
     target_id: &str,
     origins: &[String],
     origin_js: &str,
+    strict: bool,
 ) -> Result<Vec<OriginStorage>, String> {
     let attach_result: AttachToTargetResult = client
         .send_command_typed(
@@ -170,7 +226,7 @@ async fn collect_storage_in_target(
     // Blank HTML response body, pre-encoded to avoid repeated base64 work per request
     let blank_html_b64 = base64::engine::general_purpose::STANDARD.encode("<html></html>");
 
-    let _ = client
+    let fetch_result = client
         .send_command(
             "Fetch.enable",
             Some(json!({ "patterns": [{ "urlPattern": "*" }] })),
@@ -178,21 +234,25 @@ async fn collect_storage_in_target(
         )
         .await;
 
+    storage_capture_result(fetch_result, strict)?;
+
     let mut event_rx = client.subscribe();
     let mut results = Vec::new();
 
     for target_origin in origins {
         let nav_url = format!("{}/", target_origin.trim_end_matches('/'));
-        if client
+        let navigation = client
             .send_command(
                 "Page.navigate",
                 Some(json!({ "url": nav_url })),
                 Some(temp_session),
             )
-            .await
-            .is_err()
-        {
+            .await;
+        let Some(navigation) = storage_capture_result(navigation, strict)? else {
             continue;
+        };
+        if strict && navigation.get("errorText").is_some() {
+            return Err("Failed to navigate storage capture target".to_string());
         }
 
         // Fulfill intercepted requests with blank HTML until the page loads
@@ -205,7 +265,7 @@ async fn collect_storage_in_target(
                         if let Some(request_id) =
                             evt.params.get("requestId").and_then(|v| v.as_str())
                         {
-                            let _ = client
+                            let fulfilled = client
                                 .send_command(
                                     "Fetch.fulfillRequest",
                                     Some(json!({
@@ -219,6 +279,9 @@ async fn collect_storage_in_target(
                                     Some(temp_session),
                                 )
                                 .await;
+                            storage_capture_result(fulfilled, strict)?;
+                        } else if strict {
+                            return Err("Invalid storage capture event".to_string());
                         }
                     } else if evt.method == "Page.loadEventFired" {
                         page_loaded = true;
@@ -232,19 +295,30 @@ async fn collect_storage_in_target(
         }
 
         if !page_loaded {
+            if strict {
+                return Err("Storage capture target did not load".to_string());
+            }
             continue;
         }
 
-        if let Some(storage) = eval_origin_storage(client, temp_session, origin_js).await {
+        if let Some(storage) = eval_origin_storage(client, temp_session, origin_js, strict).await? {
+            if strict && storage.origin != *target_origin {
+                return Err("Storage capture origin mismatch".to_string());
+            }
             if !storage.local_storage.is_empty() || !storage.session_storage.is_empty() {
                 results.push(storage);
             }
+        } else if strict {
+            return Err("Missing storage capture origin".to_string());
         }
     }
 
     Ok(results)
 }
 
+/// Export browser state, using owner-only file permissions on Unix.
+/// Existing files are restricted before their contents are replaced; symlink paths are rejected.
+/// On Windows, files retain the destination directory's inherited ACLs.
 pub async fn save_state(
     client: &CdpClient,
     session_id: &str,
@@ -253,33 +327,67 @@ pub async fn save_state(
     session_id_str: &str,
     visited_origins: &HashSet<String>,
 ) -> Result<String, String> {
-    let cookies = cookies::get_all_cookies(client, session_id).await?;
+    save_state_inner(
+        client,
+        session_id,
+        path,
+        session_name,
+        session_id_str,
+        visited_origins,
+        false,
+        false,
+    )
+    .await
+}
+
+async fn save_state_inner(
+    client: &CdpClient,
+    session_id: &str,
+    path: Option<&str>,
+    session_name: Option<&str>,
+    session_id_str: &str,
+    visited_origins: &HashSet<String>,
+    exclusive: bool,
+    strict_capture: bool,
+) -> Result<String, String> {
+    let encryption_key = resolve_state_save_key()?;
+    let cookies = cookies::get_all_cookies(client, session_id).await;
+    let cookies = if strict_capture {
+        cookies.map_err(|_| "Failed to capture browser cookies".to_string())?
+    } else {
+        cookies?
+    };
 
     let origin_js = r#"(() => {
-        const result = { origin: location.origin, localStorage: [], sessionStorage: [] };
+        const result = { origin: location.origin, localStorage: [], sessionStorage: [], captureFailed: false };
         try {
             for (let i = 0; i < localStorage.length; i++) {
                 const key = localStorage.key(i);
                 result.localStorage.push({ name: key, value: localStorage.getItem(key) });
             }
-        } catch(e) {}
+        } catch(e) { result.captureFailed = true; }
         try {
             for (let i = 0; i < sessionStorage.length; i++) {
                 const key = sessionStorage.key(i);
                 result.sessionStorage.push({ name: key, value: sessionStorage.getItem(key) });
             }
-        } catch(e) {}
+        } catch(e) { result.captureFailed = true; }
         return result;
     })()"#;
 
     // Merge visited origins with current frame tree origins
     let mut all_origins = visited_origins.clone();
-    if let Ok(tree_result) = client
+    let tree_result = client
         .send_command_no_params("Page.getFrameTree", Some(session_id))
-        .await
-    {
-        if let Some(tree) = tree_result.get("frameTree") {
+        .await;
+    if let Some(tree_result) = storage_capture_result(tree_result, strict_capture)? {
+        if let Some(tree) = tree_result
+            .get("frameTree")
+            .filter(|tree| tree.get("frame").is_some())
+        {
             collect_frame_origins(tree, &mut all_origins);
+        } else if strict_capture {
+            return Err("Invalid storage capture frame tree".to_string());
         }
     }
 
@@ -287,7 +395,9 @@ pub async fn save_state(
     let mut origins = Vec::new();
     let mut current_origin = String::new();
 
-    if let Some(storage) = eval_origin_storage(client, session_id, origin_js).await {
+    if let Some(storage) =
+        eval_origin_storage(client, session_id, origin_js, strict_capture).await?
+    {
         current_origin = storage.origin.clone();
         if !storage.local_storage.is_empty() || !storage.session_storage.is_empty() {
             origins.push(storage);
@@ -298,9 +408,9 @@ pub async fn save_state(
     all_origins.remove(&current_origin);
     if !all_origins.is_empty() {
         let remaining: Vec<String> = all_origins.into_iter().collect();
-        if let Ok(temp_origins) =
-            collect_storage_via_temp_target(client, &remaining, origin_js).await
-        {
+        let temp_origins =
+            collect_storage_via_temp_target(client, &remaining, origin_js, strict_capture).await;
+        if let Some(temp_origins) = storage_capture_result(temp_origins, strict_capture)? {
             origins.extend(temp_origins);
         }
     }
@@ -313,7 +423,9 @@ pub async fn save_state(
         Some(p) => p.to_string(),
         None => {
             let dir = get_sessions_dir();
-            let _ = fs::create_dir_all(&dir);
+            ensure_private_state_dir(&dir).map_err(|e| {
+                format!("Failed to create state directory {}: {}", dir.display(), e)
+            })?;
             let name = session_name.unwrap_or("default");
             if !is_valid_session_name(name) {
                 return Err(session_name_error(name));
@@ -324,19 +436,130 @@ pub async fn save_state(
         }
     };
 
-    if let Ok(key) = std::env::var("AGENT_BROWSER_ENCRYPTION_KEY") {
+    if let Some(key) = encryption_key {
         let encrypted = encrypt_data(json_str.as_bytes(), &key)?;
         save_path.push_str(".enc");
-        fs::write(&save_path, &encrypted)
+        write_private_state(Path::new(&save_path), &encrypted, exclusive)
             .map_err(|e| format!("Failed to write state to {}: {}", save_path, e))?;
     } else {
-        fs::write(&save_path, &json_str)
+        write_private_state(Path::new(&save_path), json_str.as_bytes(), exclusive)
             .map_err(|e| format!("Failed to write state to {}: {}", save_path, e))?;
     }
 
     Ok(save_path)
 }
 
+fn resolve_state_save_key() -> Result<Option<String>, String> {
+    let key = match std::env::var("AGENT_BROWSER_ENCRYPTION_KEY") {
+        Ok(key) => key,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => {
+            return Err("AGENT_BROWSER_ENCRYPTION_KEY must be 64 ASCII hex characters".to_string())
+        }
+    };
+    if key.is_empty() {
+        return Ok(None);
+    }
+    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("AGENT_BROWSER_ENCRYPTION_KEY must be 64 ASCII hex characters".to_string());
+    }
+    Ok(Some(key))
+}
+
+fn ensure_private_state_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)?;
+        dir.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "State directory must be a real directory",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_private_state(path: &Path, data: &[u8], exclusive: bool) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    if exclusive {
+        options.create_new(true);
+    } else {
+        options.create(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "State path must not be a reparse point",
+            ));
+        }
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "State path must be a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.set_len(0)?;
+    file.write_all(data)
+}
+
+fn auto_state_candidate_path(tmp_dir: &Path, base_name: &str) -> Result<PathBuf, String> {
+    let mut random = [0u8; 16];
+    getrandom::getrandom(&mut random)
+        .map_err(|e| format!("Failed to generate state candidate name: {}", e))?;
+    let suffix: String = random.iter().map(|byte| format!("{:02x}", byte)).collect();
+    Ok(tmp_dir.join(format!("{}-candidate-{}.json", base_name, suffix)))
+}
+
+/// Save and validate a private candidate before rotating the last working state.
+/// Candidate creation is exclusive, so collisions never overwrite an existing file.
 pub async fn save_auto_state_transactional(
     client: &CdpClient,
     session_id: &str,
@@ -344,16 +567,56 @@ pub async fn save_auto_state_transactional(
     session_id_str: &str,
     visited_origins: &HashSet<String>,
 ) -> Result<String, String> {
+    save_state_transactional(
+        client,
+        session_id,
+        session_name,
+        session_id_str,
+        visited_origins,
+        false,
+    )
+    .await
+}
+
+/// Save a checkpoint only when all required storage captures succeed.
+/// Capture errors leave the last working state untouched; this is not an atomic browser snapshot.
+pub async fn save_checkpoint_state_transactional(
+    client: &CdpClient,
+    session_id: &str,
+    session_name: &str,
+    session_id_str: &str,
+    visited_origins: &HashSet<String>,
+) -> Result<String, String> {
+    save_state_transactional(
+        client,
+        session_id,
+        session_name,
+        session_id_str,
+        visited_origins,
+        true,
+    )
+    .await
+}
+
+async fn save_state_transactional(
+    client: &CdpClient,
+    session_id: &str,
+    session_name: &str,
+    session_id_str: &str,
+    visited_origins: &HashSet<String>,
+    strict_capture: bool,
+) -> Result<String, String> {
+    let encryption_key = resolve_state_save_key()?;
     if !is_valid_session_name(session_name) {
         return Err(session_name_error(session_name));
     }
 
     let dir = get_sessions_dir();
-    fs::create_dir_all(&dir)
+    ensure_private_state_dir(&dir)
         .map_err(|e| format!("Failed to create state directory {}: {}", dir.display(), e))?;
 
     let tmp_dir = dir.join(".tmp");
-    fs::create_dir_all(&tmp_dir).map_err(|e| {
+    ensure_private_state_dir(&tmp_dir).map_err(|e| {
         format!(
             "Failed to create temporary state directory {}: {}",
             tmp_dir.display(),
@@ -363,25 +626,23 @@ pub async fn save_auto_state_transactional(
 
     let base_name = format!("{}-{}", session_name, session_id_str);
     let final_json_path = dir.join(format!("{}.json", base_name));
-    let final_path = if std::env::var("AGENT_BROWSER_ENCRYPTION_KEY").is_ok() {
+    let final_path = if encryption_key.is_some() {
         PathBuf::from(format!("{}.enc", final_json_path.to_string_lossy()))
     } else {
         final_json_path
     };
-    let candidate_json_path = tmp_dir.join(format!(
-        "{}-candidate-{}.json",
-        base_name,
-        std::process::id()
-    ));
+    let candidate_json_path = auto_state_candidate_path(&tmp_dir, &base_name)?;
     let candidate_arg = candidate_json_path.to_string_lossy().to_string();
 
-    let candidate_path = save_state(
+    let candidate_path = save_state_inner(
         client,
         session_id,
         Some(&candidate_arg),
         Some(session_name),
         session_id_str,
         visited_origins,
+        true,
+        strict_capture,
     )
     .await?;
 
@@ -562,7 +823,13 @@ pub fn state_list() -> Result<Value, String> {
 
     let mut files = Vec::new();
 
-    let entries = fs::read_dir(&dir).map_err(|e| format!("Failed to read sessions dir: {}", e))?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({ "files": [], "directory": dir.to_string_lossy() }));
+        }
+        Err(error) => return Err(format!("Failed to read sessions dir: {}", error)),
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -849,6 +1116,262 @@ pub fn get_sessions_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_state_save_key_resolution() {
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_ENCRYPTION_KEY"]);
+        guard.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+        assert_eq!(resolve_state_save_key().unwrap(), None);
+        guard.set("AGENT_BROWSER_ENCRYPTION_KEY", "");
+        assert_eq!(resolve_state_save_key().unwrap(), None);
+        let valid = "aB09".repeat(16);
+        guard.set("AGENT_BROWSER_ENCRYPTION_KEY", &valid);
+        assert_eq!(resolve_state_save_key().unwrap(), Some(valid));
+        for invalid in [
+            "secret-invalid-key".to_string(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+            "é".repeat(32),
+        ] {
+            guard.set("AGENT_BROWSER_ENCRYPTION_KEY", &invalid);
+            let error = resolve_state_save_key().unwrap_err();
+            assert_eq!(
+                error,
+                "AGENT_BROWSER_ENCRYPTION_KEY must be 64 ASCII hex characters"
+            );
+            assert!(!error.contains(&invalid));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_state_save_key_rejects_non_unicode_without_leaking() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_ENCRYPTION_KEY"]);
+        unsafe {
+            std::env::set_var(
+                "AGENT_BROWSER_ENCRYPTION_KEY",
+                std::ffi::OsString::from_vec(vec![0xff; 64]),
+            );
+        }
+        assert_eq!(
+            resolve_state_save_key().unwrap_err(),
+            "AGENT_BROWSER_ENCRYPTION_KEY must be 64 ASCII hex characters"
+        );
+    }
+
+    fn capture_result(data: Value) -> super::super::cdp::types::EvaluateResult {
+        serde_json::from_value(json!({ "result": { "type": "object", "value": data } })).unwrap()
+    }
+
+    #[test]
+    fn test_strict_storage_capture_preserves_entries_and_empty_origins() {
+        for entries in [json!([]), json!([{ "name": "auth", "value": "secret" }])] {
+            let storage = parse_storage_capture(
+                capture_result(json!({
+                    "origin": "https://example.com",
+                    "localStorage": entries,
+                    "sessionStorage": [],
+                    "captureFailed": false
+                })),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(storage.local_storage).unwrap(),
+                entries
+            );
+        }
+    }
+
+    #[test]
+    fn test_strict_storage_capture_rejects_malformed_and_partial_results() {
+        let valid = json!({
+            "origin": "https://example.com", "localStorage": [],
+            "sessionStorage": [], "captureFailed": false
+        });
+        for field in ["origin", "localStorage", "sessionStorage", "captureFailed"] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(parse_storage_capture(capture_result(missing), true).is_err());
+            let mut malformed = valid.clone();
+            malformed[field] = json!({ "secret": "do-not-expose" });
+            let error = parse_storage_capture(capture_result(malformed), true).unwrap_err();
+            assert_eq!(error, "Failed to capture origin storage");
+        }
+        let mut partial = valid.clone();
+        partial["captureFailed"] = json!(true);
+        assert!(parse_storage_capture(capture_result(partial.clone()), true).is_err());
+        assert!(parse_storage_capture(capture_result(partial), false)
+            .unwrap()
+            .is_some());
+        for malformed in [Value::Null, json!(42), json!([])] {
+            assert!(parse_storage_capture(capture_result(malformed), true).is_err());
+        }
+        let mut invalid_entry = valid;
+        invalid_entry["localStorage"] = json!([{ "name": "auth", "value": null }]);
+        assert!(parse_storage_capture(capture_result(invalid_entry), true).is_err());
+    }
+
+    #[test]
+    fn test_storage_capture_errors_are_sanitized_and_compatibility_is_tolerant() {
+        let error =
+            storage_capture_result::<()>(Err("secret CDP message".to_string()), true).unwrap_err();
+        assert_eq!(error, "Failed to capture browser storage");
+        assert!(
+            storage_capture_result::<()>(Err("secret".to_string()), false)
+                .unwrap()
+                .is_none()
+        );
+        let result = serde_json::from_value(json!({
+            "result": { "type": "undefined" },
+            "exceptionDetails": { "text": "secret JavaScript exception" }
+        }))
+        .unwrap();
+        assert_eq!(
+            parse_storage_capture(result, true).unwrap_err(),
+            "Failed to capture origin storage"
+        );
+    }
+
+    #[test]
+    fn test_private_state_write_replaces_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.json");
+        write_private_state(&path, b"old state with trailing data", false).unwrap();
+        write_private_state(&path, b"{}", false).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn test_private_state_candidate_collision_preserves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["candidate.json", "candidate.json.enc"] {
+            let path = dir.path().join(name);
+            write_private_state(&path, b"existing state", true).unwrap();
+            let error = write_private_state(&path, b"replacement", true).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(path).unwrap(), b"existing state");
+        }
+    }
+
+    #[test]
+    fn test_auto_state_candidate_names_are_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = auto_state_candidate_path(dir.path(), "auth-session").unwrap();
+        let second = auto_state_candidate_path(dir.path(), "auth-session").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(dir.path()));
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with(".json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_state_file_modes_for_new_and_existing_exports() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["export.json", "export.json.enc"] {
+            let path = dir.path().join(name);
+            write_private_state(&path, b"new state", false).unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            write_private_state(&path, b"private replacement", false).unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"private replacement");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_state_directories_only_restrict_sessions_and_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("browser-state");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let sessions = root.join("sessions");
+        let tmp = sessions.join(".tmp");
+        for _ in 0..2 {
+            ensure_private_state_dir(&sessions).unwrap();
+            ensure_private_state_dir(&tmp).unwrap();
+            for path in [&sessions, &tmp] {
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_state_directory_rejects_symlinks_without_chmod_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("unrelated");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("sessions");
+        symlink(&target, &link).unwrap();
+        assert!(ensure_private_state_dir(&link).is_err());
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_state_writes_reject_symlink_and_dangling_candidates() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("unrelated");
+        fs::write(&target, b"do not overwrite").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("candidate.json");
+        symlink(&target, &link).unwrap();
+        for exclusive in [true, false] {
+            assert!(write_private_state(&link, b"secret", exclusive).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"do not overwrite");
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        let missing = dir.path().join("missing");
+        let dangling = dir.path().join("candidate.json.enc");
+        symlink(&missing, &dangling).unwrap();
+        assert!(write_private_state(&dangling, b"secret", true).is_err());
+        assert!(!missing.exists());
+    }
 
     #[test]
     fn test_storage_state_serialization() {

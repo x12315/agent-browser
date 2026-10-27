@@ -1287,7 +1287,7 @@ fn print_primary_response(resp: &Response, action: Option<&str>, opts: &OutputOp
                     color::success_indicator(),
                     color::green(path)
                 ),
-                "state_save" => println!(
+                "state_save" | "state_checkpoint" => println!(
                     "{} State saved to {}",
                     color::success_indicator(),
                     color::green(path)
@@ -3087,7 +3087,7 @@ Usage: agent-browser state <operation> [args]
 Save, restore, list, and manage browser state (cookies, localStorage, sessionStorage).
 
 Operations:
-  save <path>                        Save current state to file
+  save [path]                        Export state, or checkpoint the configured restore session
   load <path>                        Load state from file
   list                               List saved state files
   show <filename>                    Show state summary
@@ -3099,6 +3099,12 @@ Automatic State Persistence:
   Use --restore to auto-save/restore state across restarts:
   agent-browser --session myapp --restore open https://example.com
   Or set AGENT_BROWSER_RESTORE environment variable.
+  After verifying login, checkpoint immediately without exporting raw tokens:
+  agent-browser --session myapp --restore --restore-check-text "Account menu" state save
+  Requires a ready page and at least one nonempty app-specific restore check.
+  Repeat the same validation flags on each command; omitted flags clear checks. A successful
+  checkpoint resumes autosave after a failed restore; failures preserve old state.
+  Unix session directories/files are private (0700/0600). Encryption is optional.
 
 State Encryption:
   Set AGENT_BROWSER_ENCRYPTION_KEY (64-char hex) for AES-256-GCM encryption.
@@ -3109,6 +3115,7 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
+  agent-browser --session myapp --restore --restore-check-text "Account menu" state save
   agent-browser state save ./auth-state.json
   agent-browser state load ./auth-state.json
   agent-browser state list

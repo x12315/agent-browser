@@ -11172,6 +11172,263 @@ async fn e2e_restore_preserves_cookie_login_after_close_and_reopen() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_pathless_checkpoint_validates_and_restores_local_login() {
+    let restore_key = format!("e2e-checkpoint-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let home = tempfile::tempdir().unwrap();
+    let keys = [
+        "HOME",
+        "AGENT_BROWSER_NAMESPACE",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_RESTORE",
+        "AGENT_BROWSER_PROFILE",
+        "AGENT_BROWSER_SESSION_NAME",
+        "AGENT_BROWSER_RESTORE_SAVE",
+        "AGENT_BROWSER_STATE",
+        "AGENT_BROWSER_ENCRYPTION_KEY",
+        "AGENT_BROWSER_CDP",
+        "AGENT_BROWSER_AUTO_CONNECT",
+        "AGENT_BROWSER_PROVIDER",
+        "AGENT_BROWSER_PROXY",
+        "AGENT_BROWSER_ARGS",
+        "AGENT_BROWSER_EXTENSIONS",
+        "AGENT_BROWSER_ALLOWED_DOMAINS",
+        "AGENT_BROWSER_ACTION_POLICY",
+        "AGENT_BROWSER_CONFIRM_ACTIONS",
+        "AGENT_BROWSER_EXECUTABLE_PATH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ];
+    let env = EnvGuard::new(&keys);
+    let chrome = super::cdp::chrome::find_chrome().expect("Chrome required for checkpoint E2E");
+    for name in keys {
+        env.remove(name);
+    }
+    env.set("HOME", home.path().to_str().unwrap());
+    env.set("NO_PROXY", "*");
+    let (base_url, server) = start_cookie_login_server().await;
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({
+            "id": "launch", "action": "launch", "headless": true,
+            "executablePath": chrome,
+            "engine": "chrome", "restoreSave": "never"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "login", "action": "navigate", "url": format!("{base_url}/login")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_evaluate(
+        &mut state,
+        "storage",
+        "localStorage.setItem('checkpoint_auth', 'accepted'); true",
+        json!(true),
+    )
+    .await;
+    state.restore_check_url = Some(format!("{base_url}/login"));
+    state.restore_check_text = Some("Login complete".to_string());
+    state.restore_check_fn =
+        Some("localStorage.getItem('checkpoint_auth') === 'accepted'".to_string());
+    assert!(
+        state.session_name.is_none(),
+        "login happened before persistence was configured"
+    );
+    let page_before_checkpoint = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_session_id()
+        .unwrap()
+        .to_string();
+    let resp = execute_command(
+        &json!({ "id": "save", "action": "state_checkpoint", "restoreKey": restore_key,
+            "restoreSave": "never", "restoreCheckUrl": format!("{base_url}/login"),
+            "restoreCheckText": "Login complete", "restoreCheckFn": "localStorage.getItem('checkpoint_auth') === 'accepted'" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        state.browser.as_ref().unwrap().active_session_id().unwrap(),
+        page_before_checkpoint
+    );
+    let path = get_data(&resp)["path"].as_str().unwrap().to_string();
+    assert_eq!(state.restore_saved_path.as_deref(), Some(path.as_str()));
+    assert_eq!(state.restore_status, "saved");
+    let original = std::fs::read(&path).unwrap();
+
+    state.restore_status = "load_failed".to_string();
+    state.restore_status_detail = Some("prior corrupt restore".to_string());
+    state.restore_load_failed = true;
+    state.restore_validation_pending = true;
+    for (url_check, text_check, fn_check) in [
+        (
+            format!("{base_url}/wrong-page?code=synthetic-sensitive-url"),
+            "Login complete",
+            "true",
+        ),
+        (
+            format!("{base_url}/login"),
+            "missing checkpoint text",
+            "true",
+        ),
+        (format!("{base_url}/login"), "Login complete", "false"),
+        (
+            format!("{base_url}/login"),
+            "Login complete",
+            "(() => { throw new Error('synthetic-sensitive-function-error'); })()",
+        ),
+    ] {
+        state.restore_check_url = Some(url_check);
+        state.restore_check_text = Some(text_check.to_string());
+        state.restore_check_fn = Some(fn_check.to_string());
+        let resp = execute_command(
+            &json!({ "id": "reject", "action": "state_checkpoint" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(resp["success"], false);
+        assert!(!resp.to_string().contains("synthetic-sensitive-url"));
+        assert!(!resp
+            .to_string()
+            .contains("synthetic-sensitive-function-error"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(state.restore_load_failed);
+        assert!(state.restore_validation_pending);
+        assert_eq!(state.restore_status, "load_failed");
+        assert_eq!(
+            state.restore_status_detail.as_deref(),
+            Some("prior corrupt restore")
+        );
+    }
+    state.restore_check_fn = Some("true".to_string());
+    assert_evaluate(&mut state, "fail-storage-capture", "(() => { const storage = window.localStorage; let reads = 0; Object.defineProperty(window, 'localStorage', { configurable: true, get() { if (++reads > 1) throw new Error('synthetic-sensitive-capture-error'); return storage; } }); window.__checkpointStorage = storage; return true; })()", json!(true)).await;
+    let resp = execute_command(
+        &json!({ "id": "capture-error", "action": "state_checkpoint" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    assert!(!resp
+        .to_string()
+        .contains("synthetic-sensitive-capture-error"));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(state.restore_load_failed);
+    assert_evaluate(&mut state, "restore-storage", "(() => { Object.defineProperty(window, 'localStorage', { configurable: true, value: window.__checkpointStorage }); delete window.__checkpointStorage; return true; })()", json!(true)).await;
+    env.set("AGENT_BROWSER_ENCRYPTION_KEY", "invalid-key");
+    let resp = execute_command(
+        &json!({ "id": "write-error", "action": "state_checkpoint" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(state.restore_load_failed);
+    assert!(state.restore_validation_pending);
+    env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+
+    state.restore_validation_pending = false;
+    state.restore_save = "auto".to_string();
+    super::actions::auto_save_restore_state(&mut state)
+        .await
+        .unwrap();
+    assert_eq!(state.restore_save_status, "skipped_restore_failed");
+    let resp = execute_command(
+        &json!({ "id": "accept", "action": "state_checkpoint" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(state.restore_status, "saved");
+    assert!(!state.restore_load_failed);
+    assert!(!state.restore_validation_pending);
+    assert!(state.restore_status_detail.is_none());
+    assert_evaluate(
+        &mut state,
+        "refresh-token",
+        "localStorage.setItem('checkpoint_auth', 'refreshed'); true",
+        json!(true),
+    )
+    .await;
+    super::actions::auto_save_restore_state(&mut state)
+        .await
+        .unwrap();
+    assert_eq!(state.restore_save_status, "saved");
+    env.set("AGENT_BROWSER_ENCRYPTION_KEY", &"a".repeat(64));
+    let encrypted = execute_command(
+        &json!({ "id": "encrypted-save", "action": "state_checkpoint" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&encrypted);
+    let encrypted_path = get_data(&encrypted)["path"].as_str().unwrap();
+    assert!(encrypted_path.ends_with(".json.enc"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(encrypted_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(super::state::get_sessions_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    assert_success(
+        &execute_command(&json!({ "id": "close", "action": "close" }), &mut state).await,
+    );
+
+    let mut reopened = DaemonState::new();
+    let resp = execute_command(
+        &json!({
+            "id": "reopen", "action": "launch", "headless": true,
+            "executablePath": chrome,
+            "engine": "chrome", "restoreKey": restore_key, "restoreSave": "never"
+        }),
+        &mut reopened,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "home", "action": "navigate", "url": base_url
+        }),
+        &mut reopened,
+    )
+    .await;
+    assert_success(&resp);
+    assert_evaluate(&mut reopened, "verify", "({ cookie: document.body.innerText.includes('Welcome back'), storage: localStorage.getItem('checkpoint_auth') })", json!({ "cookie": true, "storage": "refreshed" })).await;
+    assert_success(
+        &execute_command(
+            &json!({ "id": "close-reopened", "action": "close" }),
+            &mut reopened,
+        )
+        .await,
+    );
+    cleanup_restore_state_files(&restore_key);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_restore_validation_failure_does_not_overwrite_state() {
     let restore_key = format!(
         "e2e-restore-validation-{}",

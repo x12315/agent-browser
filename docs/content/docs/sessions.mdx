@@ -54,7 +54,7 @@ With `--pin-tab`, a session whose bound tab was closed gets a `tab_gone` error i
 
 ## Chrome profile reuse
 
-The simplest way to reuse your existing login state: pass a Chrome profile name to `--profile`. agent-browser copies the profile to a temp directory (read-only snapshot) and launches Chrome with your existing cookies and sessions.
+For an explicitly authorized profile snapshot, pass a Chrome profile name to `--profile`. agent-browser copies the profile to a temp directory (read-only snapshot) and launches Chrome with its cookies and sessions. This can include unrelated sites and accounts; prefer a task/site/account-specific named session with native restore for routine authenticated work rather than copying a broad profile.
 
 ```bash
 # List available Chrome profiles
@@ -108,7 +108,7 @@ The profile directory stores:
 
 ## Import auth from your browser
 
-If you are already logged in to a site in Chrome, you can grab that auth state and reuse it in agent-browser. This is the fastest way to bypass login flows, OAuth, SSO, or 2FA.
+Prefer reusing your task's current or restored session before requesting login or exporting authentication. Import from Chrome only when explicitly needed and authorized; do not extract raw tokens or request DevTools cURL dumps as the default workflow. The portable-file example below requires protecting the export outside the repository.
 
 **Step 1:** Start Chrome with remote debugging:
 
@@ -127,48 +127,73 @@ Log in to your target site(s) in this Chrome window.
 **Step 2:** Connect and save the authenticated state:
 
 ```bash
-agent-browser --auto-connect state save ./my-auth.json
+agent-browser --session "$SESSION" --auto-connect state save "$PRIVATE_AUTH_FILE"
 ```
 
 **Step 3:** Use the saved auth in future sessions:
 
 ```bash
-# Load auth at launch
-agent-browser --state ./my-auth.json open https://app.example.com/dashboard
+# Load auth at launch, with the same app/account checks on every call
+agent-browser --session "$SESSION" --restore --restore-check-url "https://app.example.com/dashboard" --restore-check-text "Work account dashboard" --state "$PRIVATE_AUTH_FILE" open https://app.example.com/dashboard
 
 # Or load into an already-launched session
-agent-browser open about:blank
-agent-browser state load ./my-auth.json
-agent-browser open https://app.example.com/dashboard
+agent-browser --session "$SESSION" --restore --restore-check-url "https://app.example.com/dashboard" --restore-check-text "Work account dashboard" open about:blank
+agent-browser --session "$SESSION" --restore --restore-check-url "https://app.example.com/dashboard" --restore-check-text "Work account dashboard" state load "$PRIVATE_AUTH_FILE"
+agent-browser --session "$SESSION" --restore --restore-check-url "https://app.example.com/dashboard" --restore-check-text "Work account dashboard" open https://app.example.com/dashboard
 ```
 
 Combine with `--session <id> --restore` so the imported auth auto-persists across restarts:
 
 ```bash
-SESSION="$(agent-browser session id --scope worktree --prefix myapp)"
-agent-browser --session "$SESSION" --restore --state ./my-auth.json open https://app.example.com/dashboard
+# Recover the same SESSION key and checks; PRIVATE_AUTH_FILE is outside Git.
+agent-browser --session "$SESSION" --restore --restore-check-url "https://app.example.com/dashboard" --restore-check-text "Work account dashboard" --state "$PRIVATE_AUTH_FILE" open https://app.example.com/dashboard
 # From now on, state auto-saves/restores for this session
 ```
 
-State files contain session tokens in plaintext. Add them to `.gitignore` and delete when no longer needed. For encryption at rest, see [State encryption](#state-encryption) below.
+Set `PRIVATE_AUTH_FILE` to an access-protected path outside the repository before exporting. State files contain session tokens and are plaintext without encryption; never put raw cookies, tokens, or state contents in Git or logs. Remove portable exports only when no longer needed under your explicit cleanup policy, not as error recovery. For encryption at rest, see [State encryption](#state-encryption) below.
 
 ## Session persistence
 
 Use `--restore` with a stable `--session` to automatically save and restore cookies and localStorage across browser restarts:
 
 ```bash
-# Auto-save/load state for this worktree
-SESSION="$(agent-browser session id --scope worktree --prefix twitter)"
-agent-browser --session "$SESSION" --restore open twitter.com
-
-# Login once, then state persists automatically
-agent-browser --session "$SESSION" --restore click "#login"
-
-# Optional validation prevents a bad restore from overwriting the previous good state
-agent-browser --session "$SESSION" --restore --restore-check-text Dashboard open twitter.com
+# Derive ONCE for this task/site/account, not once per shell invocation.
+SESSION="$(agent-browser session id --scope worktree --prefix task-myapp-work)"
+export AGENT_BROWSER_SESSION="$SESSION"
+export AGENT_BROWSER_RESTORE="$SESSION"
+# Recreate this helper in each shell from the nonsecret task record.
+browser() {
+    agent-browser --session "$SESSION" --restore --restore-save auto \
+        --restore-check-url "https://app.example.com/dashboard" \
+        --restore-check-text "Work account dashboard" "$@"
+}
+browser session info --json
+browser open https://app.example.com/dashboard
+browser wait --url "https://app.example.com/dashboard"
+browser wait --text "Work account dashboard"
 ```
 
-State files are stored in `~/.agent-browser/sessions/` and automatically loaded before navigation. With the default `--restore-save auto` policy, failed restore or failed validation skips auto-save.
+Record the nonsecret session key, application/account-specific validation options (`--restore-check-url`, `--restore-check-text`, and/or `--restore-check-fn`), and any explicitly used nonsecret namespace/engine/profile launch identity in task/handoff notes and recover them after context resets, harness switches, separate shells, or working-directory changes. Never copy credential values into notes. Pass the same full session, restore, and validation flags on every command, including inspection, waits, `state save`, and close, as the helper does. Checks are not sticky across CLI calls: a later `--restore` call that omits them clears the checks supplied at launch. Recreate the helper in each shell from the task record. Do not rederive a different worktree key, hijack the shared default, or reuse an unrelated account's session.
+
+Check current/restored authentication and the intended application/account signal before prompting for login. If login is needed, leave the SAME browser open for the user to complete it. A timeout or navigation error alone does not prove expiry. Never clear cookies or delete saved authentication as routine recovery; server expiry, revocation, MFA, or an intentional account switch can genuinely require login and should be explained.
+
+State files are stored in `~/.agent-browser/sessions/` and automatically loaded before navigation. With the default `--restore-save auto` policy, failed restore or failed validation skips auto-save. Keep this default rather than changing the global policy to `always`.
+
+### Checkpoint immediately after login
+
+The core skill's `authenticated-session.sh` template saves refreshed authentication after successful verification in both modes. Normal mode navigates to the protected target first; `--checkpoint` skips navigation to preserve the current manual-login page. Both verify readiness, URL and account text, then call native pathless `state save` exactly once. A failed check or save returns failure without retrying, closing the browser, or deleting saved state.
+
+After the user completes login, preserve the current page, verify readiness and an application/account-specific signal, then save immediately instead of waiting for the 30-second autosave interval:
+
+```bash
+# Use the helper above with the SAME validation flags on every invocation.
+browser wait --load domcontentloaded
+browser wait --url "https://app.example.com/dashboard"
+browser wait --text "Work account dashboard"
+browser state save
+```
+
+Pathless `state save` is an explicit checkpoint to the native private restore store and does not require an encryption key. On Unix, owner-private directories (0700) and files (0600) protect plaintext state by default. Windows inherits the destination's ACLs; use trusted private user storage. A missing key is not a reason to request login, reconstruct authentication, or export cookies. It requires page readiness and at least one nonempty application-specific `--restore-check-url`, `--restore-check-text`, or `--restore-check-fn`, and verifies every supplied check. Missing checks are an error; readiness alone must not checkpoint a generic login page. Only a successful checkpoint clears a prior restore-failure autosave block; a failed check or save preserves the old checkpoint and block. Explicit `state save <path>` remains a portable-file export, not this checkpoint. Persistence reuses authentication but cannot prevent server-side token expiry.
 
 When `--restore` or another restore key is configured, state is saved when the browser closes (explicit `close`, idle timeout, or daemon shutdown) and also periodically while the browser is open, so a browser window you close by hand still leaves a recent save behind. A session ID by itself only isolates the daemon and does not enable persistence; without a restore key, shutdown discards transient browser state and open tabs. Periodic autosave waits for commands to settle, then saves at most once per `AGENT_BROWSER_AUTOSAVE_INTERVAL_MS` (default 30000; set to `0` to save only on close). Idle sessions with configured persistence keep saving on the same interval, so changes the page makes on its own (token refreshes, background requests) are captured too. The daemon exits after one hour without commands or dashboard input by default; `--idle-timeout <time>` or `AGENT_BROWSER_IDLE_TIMEOUT_MS` tunes this, and `0` disables it. Headed, Safari/iOS WebDriver, and user-attached browsers are exempt from the default timeout; provider-owned cloud browsers are not. State saving respects the `--restore-save` policy.
 
@@ -188,20 +213,19 @@ agent-browser --session "foo/bar" --restore open example.com    # slashes
 
 ## State encryption
 
-Encrypt saved state files (cookies, localStorage) using AES-256-GCM:
+Encryption is optional; native private persistence works without a key. To encrypt saved state files (cookies, localStorage) using AES-256-GCM, reuse a durable existing 64-hex-character `AGENT_BROWSER_ENCRYPTION_KEY` from trusted local secret storage. Reject malformed supplied keys without printing them. Never generate or rotate keys or passwords, or use a per-run random key. Existing encrypted state still needs its original key; preserve it and recover that key rather than replacing state or requesting login.
 
 ```bash
-# Generate a 256-bit key (64 hex characters)
-openssl rand -hex 32
+# Reuse the durable existing 64-hex-character key from trusted local secret storage.
+# Configure AGENT_BROWSER_ENCRYPTION_KEY outside command logs and Git.
+# Do not generate a new random key on each invocation.
 
-# Set the encryption key
-export AGENT_BROWSER_ENCRYPTION_KEY=<your-64-char-hex-key>
-
-# State files are now encrypted automatically
-agent-browser --session secure-session --restore open example.com
+# State files are now encrypted automatically; retain the SAME checks.
+# Use the browser helper from Session persistence above.
+browser open https://app.example.com/dashboard
 
 # List states shows encryption status
-agent-browser state list
+browser state list
 ```
 
 ## State auto-expiration
@@ -234,7 +258,10 @@ agent-browser state clear my-session
 # Clear all saved states
 agent-browser state clear --all
 
-# Manual save/load (for custom paths)
+# Explicit native checkpoint with the same checks as every other restore call
+agent-browser --session "$SESSION" --restore --restore-check-url "https://app.example.com/dashboard" --restore-check-text "Work account dashboard" state save
+
+# Manual save/load (for custom paths; keep exports outside Git)
 agent-browser state save ./backup.json
 agent-browser state load ./backup.json
 ```
@@ -294,7 +321,7 @@ agent-browser set headers '{"X-Custom-Header": "value"}'
     <tr><td><code>AGENT_BROWSER_RESTORE_CHECK_TEXT</code></td><td>Page text restored state must contain</td></tr>
     <tr><td><code>AGENT_BROWSER_RESTORE_CHECK_FN</code></td><td>JavaScript expression restored state must satisfy</td></tr>
     <tr><td><code>AGENT_BROWSER_SESSION_NAME</code></td><td>Legacy auto-save/load state persistence name</td></tr>
-    <tr><td><code>AGENT_BROWSER_ENCRYPTION_KEY</code></td><td>64-char hex key for AES-256-GCM encryption</td></tr>
+    <tr><td><code>AGENT_BROWSER_ENCRYPTION_KEY</code></td><td>Optional existing 64-char hex key for AES-256-GCM encryption</td></tr>
     <tr><td><code>AGENT_BROWSER_STATE_EXPIRE_DAYS</code></td><td>Auto-delete states older than N days (default: 30)</td></tr>
   </tbody>
 </table>

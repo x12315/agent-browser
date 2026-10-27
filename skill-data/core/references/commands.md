@@ -360,8 +360,10 @@ Other capabilities use the same protocol:
 ## State Management
 
 ```bash
-agent-browser state save auth.json    # Save cookies, storage, auth state
-agent-browser state load auth.json    # Restore saved state
+agent-browser --session "$SESSION" --restore --restore-check-text "Signed in as my-account" state save
+# Native checkpoint: repeat the same session/restore/check flags on every call.
+agent-browser state save "$PRIVATE_AUTH_FILE"  # Explicit export outside Git
+agent-browser state load "$PRIVATE_AUTH_FILE"  # Explicit import
 ```
 
 ## Live Streaming

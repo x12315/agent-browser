@@ -1,109 +1,71 @@
 #!/bin/bash
-# Template: Authenticated Session Workflow
-# Purpose: Login once, save state, reuse for subsequent runs
-# Usage: ./authenticated-session.sh <login-url> [state-file]
-#
-# RECOMMENDED: Use the auth vault instead of this template:
-#   echo "<pass>" | agent-browser auth save myapp --url <login-url> --username <user> --password-stdin
-#   agent-browser auth login myapp
-# The auth vault stores credentials securely and the LLM never sees passwords.
-#
-# Environment variables:
-#   APP_USERNAME - Login username/email
-#   APP_PASSWORD - Login password
-#
-# Two modes:
-#   1. Discovery mode (default): Shows form structure so you can identify refs
-#   2. Login mode: Performs actual login after you update the refs
-#
-# Setup steps:
-#   1. Run once to see form structure (discovery mode)
-#   2. Update refs in LOGIN FLOW section below
-#   3. Set APP_USERNAME and APP_PASSWORD
-#   4. Delete the DISCOVERY section
-
+# Reuse one task/site/account session; checkpoint only verified authentication.
+# Usage: ./authenticated-session.sh <protected-url> <signed-in-text> [--checkpoint]
+# Caller must retain AGENT_BROWSER_SESSION and these nonsecret validation inputs
+# in the task record across invocations, plus any explicitly used nonsecret
+# namespace/engine/profile launch identity. Never copy credential values into
+# notes. browser() repeats the same full checks
+# on EVERY call, including state save: restore checks are not sticky across CLI
+# calls. A native checkpoint with no nonempty app-specific check is an error.
+# The owner-private native store is the baseline; encryption is optional.
+# For encryption, reuse a durable existing key from trusted local secret storage.
+# Never generate or rotate keys/passwords, or use a per-run random key.
+# Exit 2 means verification needs attention; the same browser stays open for
+# manual login if needed. Other failures exit 1. No credentials are accepted.
 set -euo pipefail
 
-LOGIN_URL="${1:?Usage: $0 <login-url> [state-file]}"
-STATE_FILE="${2:-./auth-state.json}"
-
-echo "Authentication workflow: $LOGIN_URL"
-
-# ================================================================
-# SAVED STATE: Skip login if valid saved state exists
-# ================================================================
-if [[ -f "$STATE_FILE" ]]; then
-    echo "Loading saved state from $STATE_FILE..."
-    if agent-browser --state "$STATE_FILE" open "$LOGIN_URL" 2>/dev/null; then
-        agent-browser wait --load load
-
-        CURRENT_URL=$(agent-browser get url)
-        if [[ "$CURRENT_URL" != *"login"* ]] && [[ "$CURRENT_URL" != *"signin"* ]]; then
-            echo "Session restored successfully"
-            agent-browser snapshot -i
-            exit 0
-        fi
-        echo "Session expired, performing fresh login..."
-        agent-browser close 2>/dev/null || true
-    else
-        echo "Failed to load state, re-authenticating..."
-    fi
-    rm -f "$STATE_FILE"
+if [[ $# -lt 2 || $# -gt 3 || ( $# -eq 3 && "$3" != "--checkpoint" ) ]]; then
+    printf 'Usage: %s <protected-url> <signed-in-text> [--checkpoint]\n' "$0" >&2
+    exit 1
+fi
+if [[ ! "${AGENT_BROWSER_SESSION:-}" =~ ^[a-zA-Z0-9_-]+$ || "${AGENT_BROWSER_SESSION:-}" == "default" ]]; then
+    printf 'Set AGENT_BROWSER_SESSION to the existing task/site/account key, not the shared default.\n' >&2
+    exit 1
+fi
+if [[ -n "${AGENT_BROWSER_ENCRYPTION_KEY:-}" && ! "${AGENT_BROWSER_ENCRYPTION_KEY:-}" =~ ^[a-fA-F0-9]{64}$ ]]; then
+    printf 'Invalid encryption key format; expected 64 hexadecimal characters. The supplied value is not shown.\n' >&2
+    exit 1
+fi
+if ! command -v agent-browser >/dev/null 2>&1; then
+    printf 'agent-browser is required.\n' >&2
+    exit 1
 fi
 
-# ================================================================
-# DISCOVERY MODE: Shows form structure (delete after setup)
-# ================================================================
-echo "Opening login page..."
-agent-browser open "$LOGIN_URL"
-agent-browser wait --load domcontentloaded
-agent-browser wait --fn "(() => { const usable = (el) => { const style = getComputedStyle(el); return !el.disabled && !el.readOnly && style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length > 0; }; const username = Array.from(document.querySelectorAll('input[type=email], input[type=text], input[autocomplete=username], input[name*=email i], input[name*=user i], input[name*=login i]')).some(usable); const password = Array.from(document.querySelectorAll('input[type=password]')).some(usable); return username && password; })()"
+PROTECTED_URL="$1"
+SIGNED_IN_TEXT="$2"
+if [[ ! "$PROTECTED_URL" =~ ^https?:// || -z "$SIGNED_IN_TEXT" ]]; then
+    printf 'Provide a protected HTTP(S) URL and a nonsecret signed-in account signal.\n' >&2
+    exit 1
+fi
 
-echo ""
-echo "Login form structure:"
-echo "---"
-agent-browser snapshot -i
-echo "---"
-echo ""
-echo "Next steps:"
-echo "  1. Note the refs: username=@e?, password=@e?, submit=@e?"
-echo "  2. Update the LOGIN FLOW section below with your refs"
-echo "  3. Set: export APP_USERNAME='...' APP_PASSWORD='...'"
-echo "  4. Delete this DISCOVERY MODE section"
-echo ""
-agent-browser close
-exit 0
+browser() {
+    agent-browser --session "$AGENT_BROWSER_SESSION" --restore \
+        --restore-save auto --restore-check-url "$PROTECTED_URL" \
+        --restore-check-text "$SIGNED_IN_TEXT" "$@" >/dev/null 2>&1
+}
 
-# ================================================================
-# LOGIN FLOW: Uncomment and customize after discovery
-# ================================================================
-# : "${APP_USERNAME:?Set APP_USERNAME environment variable}"
-# : "${APP_PASSWORD:?Set APP_PASSWORD environment variable}"
-#
-# agent-browser open "$LOGIN_URL"
-# agent-browser wait --load domcontentloaded
-# agent-browser wait --fn "(() => { const usable = (el) => { const style = getComputedStyle(el); return !el.disabled && !el.readOnly && style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length > 0; }; const username = Array.from(document.querySelectorAll('input[type=email], input[type=text], input[autocomplete=username], input[name*=email i], input[name*=user i], input[name*=login i]')).some(usable); const password = Array.from(document.querySelectorAll('input[type=password]')).some(usable); return username && password; })()"
-# agent-browser snapshot -i
-#
-# # Fill credentials (update refs to match your form)
-# agent-browser fill @e1 "$APP_USERNAME"
-# agent-browser fill @e2 "$APP_PASSWORD"
-# agent-browser click @e3
-# Replace this with the app-specific post-login wait, for example:
-# agent-browser wait --url "**/dashboard"
-# agent-browser wait --text "Welcome"
-#
-# # Verify login succeeded
-# FINAL_URL=$(agent-browser get url)
-# if [[ "$FINAL_URL" == *"login"* ]] || [[ "$FINAL_URL" == *"signin"* ]]; then
-#     echo "Login failed - still on login page"
-#     agent-browser screenshot /tmp/login-failed.png
-#     agent-browser close
-#     exit 1
-# fi
-#
-# # Save state for future runs
-# echo "Saving state to $STATE_FILE"
-# agent-browser state save "$STATE_FILE"
-# echo "Login successful"
-# agent-browser snapshot -i
+if ! browser session info --json; then
+    printf 'Session inspection failed; existing state was not deleted.\n' >&2
+    exit 1
+fi
+
+if [[ "${3:-}" != "--checkpoint" ]]; then
+    if ! browser open "$PROTECTED_URL"; then
+        printf 'Protected-page navigation failed; inspect this session before retrying. Existing state was not deleted.\n' >&2
+        exit 1
+    fi
+fi
+
+if ! browser wait --load domcontentloaded ||
+   ! browser wait --url "$PROTECTED_URL" ||
+   ! browser wait --text "$SIGNED_IN_TEXT"; then
+    printf 'Signed-in verification did not pass. Inspect the same session for loading errors or the wrong account before requesting login.\n' >&2
+    printf 'If login is needed, complete it manually in this same browser (use the dashboard if headless), then rerun with the same session key and --checkpoint.\n' >&2
+    exit 2
+fi
+
+if ! browser state save; then
+    printf 'Checkpoint failed; existing saved state was not deleted. Inspect readiness and configured login checks.\n' >&2
+    exit 1
+fi
+printf 'Verified authentication checkpoint saved in the native private restore store.\n'
