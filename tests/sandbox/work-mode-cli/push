@@ -1,0 +1,4 @@
+dist/sandbox-inputs/work-mode-source.tar.gz:/tmp/ahsb-push/work-mode-source.tar.gz
+dist/sandbox-inputs/agent-browser-candidate:/tmp/ahsb-push/agent-browser-candidate
+test/sandbox/work-mode/cli-guest.sh:/tmp/ahsb-push/cli-guest.sh
+test/sandbox/work-mode/cli-smoke.py:/tmp/ahsb-push/cli-smoke.py

@@ -597,7 +597,11 @@ async fn handle_connection<S>(
                     break;
                 }
 
-                if close_completed_response(&action, &response) {
+                if close_completed_response(
+                    &action,
+                    response.get("success").and_then(Value::as_bool) == Some(true),
+                    response.get("data"),
+                ) {
                     if let Some(ref path) = stream_file_cleanup {
                         let _ = fs::remove_file(path);
                     }
@@ -621,7 +625,9 @@ fn looks_like_http(line: &str) -> bool {
     prefixes.iter().any(|p| line.starts_with(p))
 }
 
-fn close_completed_response(action: &str, response: &Value) -> bool {
+/// Identify the completed close responses that trigger daemon shutdown, including
+/// a close executed by confirmation. Shared with the client's shutdown handshake.
+pub(crate) fn close_completed_response(action: &str, success: bool, data: Option<&Value>) -> bool {
     if !matches!(
         action,
         "close" | "confirm" | INTERNAL_DAEMON_SHUTDOWN_ACTION
@@ -633,11 +639,11 @@ fn close_completed_response(action: &str, response: &Value) -> bool {
         data.get("closed").and_then(|v| v.as_bool()) == Some(true)
     }
 
-    if response.get("success").and_then(|v| v.as_bool()) != Some(true) {
+    if !success {
         return false;
     }
 
-    let Some(data) = response.get("data") else {
+    let Some(data) = data else {
         return false;
     };
     if data_closed(data) {
@@ -819,7 +825,11 @@ mod tests {
             }
         });
 
-        assert!(!close_completed_response("close", &confirmation_response));
+        assert!(!close_completed_response(
+            "close",
+            true,
+            confirmation_response.get("data")
+        ));
     }
 
     #[test]
@@ -840,12 +850,17 @@ mod tests {
             }
         });
 
-        assert!(close_completed_response("close", &direct));
+        assert!(close_completed_response("close", true, direct.get("data")));
         assert!(close_completed_response(
             crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION,
-            &direct
+            true,
+            direct.get("data")
         ));
-        assert!(close_completed_response("confirm", &confirmed));
+        assert!(close_completed_response(
+            "confirm",
+            true,
+            confirmed.get("data")
+        ));
     }
 
     #[tokio::test]

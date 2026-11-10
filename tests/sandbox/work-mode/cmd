@@ -1,0 +1,2 @@
+set -eu
+bash /tmp/ahsb-push/guest.sh

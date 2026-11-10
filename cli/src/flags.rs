@@ -366,6 +366,8 @@ pub fn load_config(args: &[String]) -> Result<Config, String> {
 pub struct Flags {
     pub json: bool,
     pub headed: bool,
+    /// Opt-in native session policy; no config or environment default.
+    pub work_mode: Option<String>,
     pub debug: bool,
     pub session: String,
     pub restore: Option<String>,
@@ -536,6 +538,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
 
     let mut flags = Flags {
         json: env_var_is_truthy("AGENT_BROWSER_JSON") || config.json.unwrap_or(false),
+        work_mode: None,
         headed: env_var_is_truthy("AGENT_BROWSER_HEADED") || config.headed.unwrap_or(false),
         debug: env_var_is_truthy("AGENT_BROWSER_DEBUG") || config.debug.unwrap_or(false),
         session: env::var("AGENT_BROWSER_SESSION")
@@ -716,6 +719,10 @@ pub fn parse_flags(args: &[String]) -> Flags {
                 if consumed {
                     i += 1;
                 }
+            }
+            "--work-mode" => {
+                flags.work_mode = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 1;
             }
             "--headed" => {
                 let (val, consumed) = parse_bool_arg(args, i);
@@ -1144,6 +1151,11 @@ pub fn parse_flags(args: &[String]) -> Flags {
         }
         i += 1;
     }
+    if !flags.cli_headed {
+        if let Some(mode) = flags.work_mode.as_deref() {
+            flags.headed = mode == "collaboration";
+        }
+    }
     flags
 }
 
@@ -1185,6 +1197,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
     ];
     // Global flags that always take a value (need to skip the next arg too)
     const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
+        "--work-mode",
         "--session",
         "--restore-save",
         "--restore-check-url",
@@ -1857,6 +1870,31 @@ mod tests {
     }
 
     // === Boolean flag value tests ===
+
+    #[test]
+    fn work_mode_overrides_headed_defaults_but_preserves_explicit_choice() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_HEADED"]);
+        guard.set("AGENT_BROWSER_HEADED", "1");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), r#"{"headed": true}"#).unwrap();
+        let mut argv = vec![
+            "--config".to_string(),
+            file.path().to_string_lossy().to_string(),
+        ];
+        argv.extend(args("--session mode-test --work-mode background open"));
+        let flags = parse_flags(&argv);
+        assert_eq!(flags.work_mode.as_deref(), Some("background"));
+        assert!(!flags.headed);
+        assert!(!flags.cli_headed);
+        assert_eq!(clean_args(&argv), args("open"));
+        argv.extend(args("--headed true"));
+        let flags = parse_flags(&argv);
+        assert!(flags.headed);
+        assert!(flags.cli_headed);
+        assert!(crate::commands::parse_command(&clean_args(&argv), &flags).is_err());
+        let flags = parse_flags(&args("--session mode-test --work-mode collaboration open"));
+        assert!(flags.headed);
+    }
 
     #[test]
     fn test_headed_false() {

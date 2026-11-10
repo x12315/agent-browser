@@ -328,22 +328,53 @@ fn parse_cookie_header(header: &str) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
+/// Parse CLI commands and carry explicit work-mode intent to every daemon path.
 pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError> {
-    let mut result = parse_command_inner(args, flags)?;
-
-    // Inject AGENT_BROWSER_DEFAULT_TIMEOUT into any wait-family command that
-    // doesn't already carry an explicit timeout. Centralised here so that new
-    // wait variants automatically inherit the default without per-variant wiring.
-    if let Some(action) = result.get("action").and_then(|a| a.as_str()) {
-        if action.starts_with("wait") && result.get("timeout").is_none() {
-            if let Some(t) = flags.default_timeout {
-                result["timeout"] = json!(t);
+    let mut cmd = parse_command_inner(args, flags)?;
+    if let Some(mode) = flags
+        .work_mode
+        .as_deref()
+        .filter(|_| cmd["action"] != "close")
+    {
+        let error = if !matches!(mode, "collaboration" | "background") {
+            Some("--work-mode must be collaboration or background")
+        } else if flags.session == "default" || flags.session.is_empty() {
+            Some("--work-mode requires a nondefault named --session")
+        } else if flags.cli_headed && flags.headed != (mode == "collaboration") {
+            Some("Explicit --headed conflicts with --work-mode")
+        } else {
+            None
+        };
+        if let Some(message) = error {
+            return Err(ParseError::InvalidValue {
+                message: message.to_string(),
+                usage: "--session <name> --work-mode collaboration|background <command>",
+            });
+        }
+    }
+    if let Some(action) = cmd.get("action").and_then(Value::as_str) {
+        if action.starts_with("wait") && cmd.get("timeout").is_none() {
+            if let Some(timeout) = flags.default_timeout {
+                cmd["timeout"] = json!(timeout);
             }
         }
     }
-    attach_ca_cert_to_launch_command(&mut result, flags);
+    attach_ca_cert_to_launch_command(&mut cmd, flags);
+    attach_work_mode(&mut cmd, flags);
+    Ok(cmd)
+}
 
-    Ok(result)
+/// Attach policy intent to synthetic prelaunch envelopes as well as commands.
+pub fn attach_work_mode(cmd: &mut Value, flags: &Flags) {
+    if let Some(mode) = &flags.work_mode {
+        cmd["workMode"] = json!(mode);
+    }
+    if flags.cli_headed {
+        cmd["requestedHeaded"] = json!(flags.headed);
+    }
+    if cmd.get("action").and_then(Value::as_str) == Some("launch") && !flags.cli_headed {
+        cmd["headedDefault"] = json!(true);
+    }
 }
 
 pub fn attach_ca_cert_to_launch_command(cmd: &mut Value, flags: &Flags) {
@@ -3584,6 +3615,7 @@ mod tests {
             session: "test".to_string(),
             json: false,
             headed: false,
+            work_mode: None,
             debug: false,
             headers: None,
             executable_path: None,
@@ -4194,6 +4226,38 @@ mod tests {
         let cmd = parse_command(&args("open"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "launch");
         assert_eq!(cmd["headless"], true);
+    }
+
+    #[test]
+    fn work_mode_parser_carries_intent_for_launch_commands_and_batches() {
+        for command in [
+            "open",
+            "open https://example.com",
+            "connect 9222",
+            "batch open",
+        ] {
+            let args: Vec<String> =
+                format!("--session mode-test --work-mode background {}", command)
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect();
+            let flags = crate::flags::parse_flags(&args);
+            let cmd = parse_command(&crate::flags::clean_args(&args), &flags).unwrap();
+            assert_eq!(cmd["workMode"], "background");
+        }
+        let mut flags = default_flags();
+        flags.work_mode = Some("background".to_string());
+        flags.session = "default".to_string();
+        assert!(parse_command(&["open".to_string()], &flags).is_err());
+        flags.session = "mode-test".to_string();
+        flags.cli_headed = true;
+        flags.headed = true;
+        assert!(parse_command(&["open".to_string()], &flags).is_err());
+        assert!(parse_command(&["close".to_string()], &flags).is_ok());
+        let mut envelope = json!({"action": "launch"});
+        attach_work_mode(&mut envelope, &flags);
+        assert_eq!(envelope["requestedHeaded"], true);
+        assert_eq!(envelope["workMode"], "background");
     }
 
     #[test]

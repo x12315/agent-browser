@@ -766,30 +766,118 @@ fn wait_for_daemon_exit(session: &str, timeout: Duration) -> bool {
         if !daemon_ready(session) {
             return true;
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100).min(timeout.saturating_sub(start.elapsed())));
     }
     !daemon_ready(session)
 }
 
-fn request_graceful_daemon_shutdown(session: &str) -> bool {
+fn request_graceful_daemon_shutdown(session: &str) -> Result<bool, String> {
     let close_cmd = json!({
         "id": "restart-close",
         "action": INTERNAL_DAEMON_SHUTDOWN_ACTION
     });
 
     match send_command(close_cmd, session) {
-        Ok(resp) if resp.success => wait_for_daemon_exit(session, Duration::from_secs(5)),
-        _ => false,
+        Ok(resp)
+            if crate::native::daemon::close_completed_response(
+                INTERNAL_DAEMON_SHUTDOWN_ACTION,
+                resp.success,
+                resp.data.as_ref(),
+            ) =>
+        {
+            Ok(true)
+        }
+        Ok(resp) if resp.code.as_deref() == Some("daemon_shutdown_unconfirmed") => Err(resp
+            .error
+            .unwrap_or_else(|| "Daemon shutdown unconfirmed".to_string())),
+        Ok(resp)
+            if resp
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("Work-mode browser is active")) =>
+        {
+            Err(resp.error.unwrap())
+        }
+        _ => Ok(false),
     }
 }
 
-fn stop_existing_daemon_for_restart(session: &str) {
-    if !request_graceful_daemon_shutdown(session) {
+fn check_work_mode_capability(session: &str, work_mode: Option<&str>) -> Result<(), String> {
+    if work_mode.is_none() {
+        return Ok(());
+    }
+    let error = "Cannot verify daemon work-mode capability: --work-mode requires session_info workModePolicyVersion: 1. Refusing to change or restart this session; close it explicitly and start a compatible daemon.";
+    let resp = send_command(
+        json!({"id": "work-mode-capability-check", "action": "session_info"}),
+        session,
+    )
+    .map_err(|_| error.to_string())?;
+    if !resp.success
+        || resp
+            .data
+            .as_ref()
+            .and_then(|data| data.get("workModePolicyVersion"))
+            .and_then(Value::as_u64)
+            != Some(1)
+    {
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+fn check_work_mode_restart(session: &str, requested_mode: Option<&str>) -> Result<(), String> {
+    let resp = send_command(json!({"id": "work-mode-restart-check", "action": "session_info"}), session)
+        .map_err(|_| "Cannot verify live work-mode policy; refusing automatic daemon restart. Close the session explicitly first.".to_string())?;
+    let data = resp
+        .data
+        .as_ref()
+        .filter(|_| resp.success)
+        .ok_or("Cannot verify live work-mode policy; refusing automatic daemon restart")?;
+    validate_work_mode_restart(data, requested_mode)
+}
+
+fn validate_work_mode_restart(
+    data: &serde_json::Value,
+    requested_mode: Option<&str>,
+) -> Result<(), String> {
+    let live = data
+        .get("browserLaunched")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or("Cannot verify browser liveness; refusing automatic daemon restart")?;
+    if live
+        && (requested_mode.is_some()
+            || data
+                .get("workMode")
+                .and_then(serde_json::Value::as_str)
+                .is_some())
+    {
+        return Err("Work-mode browser is active; refusing automatic daemon restart. Close the session explicitly first.".to_string());
+    }
+    Ok(())
+}
+
+fn stop_existing_daemon_for_restart(session: &str) -> Result<(), String> {
+    if !request_graceful_daemon_shutdown(session)? {
+        check_work_mode_restart(session, None)?;
         kill_stale_daemon(session);
     }
+    Ok(())
 }
 
 pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
+    ensure_daemon_with_work_mode(session, opts, None)
+}
+
+/// Ensure daemon compatibility without automatically replacing a protected browser.
+/// Opt-in work modes require a read-only session_info workModePolicyVersion: 1
+/// handshake before existing-daemon restart checks and after daemon startup.
+/// Missing or unsupported capability fails without changing or stopping the daemon;
+/// callers without a work mode retain the legacy path without a handshake.
+pub fn ensure_daemon_with_work_mode(
+    session: &str,
+    opts: &DaemonOptions,
+    work_mode: Option<&str>,
+) -> Result<DaemonResult, String> {
     let mut restarted = false;
 
     // Socket connectivity is the sole liveness check — no PID check — so
@@ -802,21 +890,24 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     // this check is handled at request time: callers respawn via
     // ensure_daemon when the request fails with daemon_unreachable().
     if daemon_ready(session) {
+        check_work_mode_capability(session, work_mode)?;
         // Check version: if the running daemon is from a different CLI
         // version (e.g. after an upgrade), kill it and start a fresh one.
         if !daemon_version_matches(session) {
+            check_work_mode_restart(session, work_mode)?;
             eprintln!(
                 "{} Daemon version mismatch detected, restarting...",
                 crate::color::warning_indicator()
             );
-            stop_existing_daemon_for_restart(session);
+            stop_existing_daemon_for_restart(session)?;
             restarted = true;
             // Fall through to spawn a new daemon below
         } else {
             match ready_existing_daemon_result(session, opts, Duration::from_secs(1)) {
                 Some(result) => return Ok(result),
                 None => {
-                    stop_existing_daemon_for_restart(session);
+                    check_work_mode_restart(session, work_mode)?;
+                    stop_existing_daemon_for_restart(session)?;
                     restarted = true;
                 }
             }
@@ -919,6 +1010,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
 
     for _ in 0..50 {
         if daemon_ready(session) {
+            check_work_mode_capability(session, work_mode)?;
             if let Some(result) = ready_spawned_daemon_result(session, opts, spawned_pid, restarted)
             {
                 return Ok(result);
@@ -949,6 +1041,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
                 {
                     thread::sleep(Duration::from_millis(200));
                     if daemon_ready(session) {
+                        check_work_mode_capability(session, work_mode)?;
                         if wait_for_matching_ready_daemon(session, opts, Duration::from_secs(1)) {
                             return Ok(DaemonResult {
                                 already_running: true,
@@ -1050,8 +1143,41 @@ fn is_read_only(cmd: &Value) -> bool {
         .is_some_and(|action| READ_ONLY_ACTIONS.contains(&action))
 }
 
+/// Send a command without replaying ambiguous mutations. A confirmed close also
+/// waits up to five seconds for the daemon endpoint to stop accepting connections.
+/// Shutdown timeout returns a failed response retaining the confirmed close data.
 pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
-    send_with_retry(is_read_only(&cmd), || send_command_once(&cmd, session))
+    send_command_with_shutdown_timeout(cmd, session, Duration::from_secs(5))
+}
+
+fn send_command_with_shutdown_timeout(
+    cmd: Value,
+    session: &str,
+    shutdown_timeout: Duration,
+) -> Result<Response, String> {
+    let mut response = send_with_retry(is_read_only(&cmd), || send_command_once(&cmd, session))?;
+    let action = cmd
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if crate::native::daemon::close_completed_response(
+        action,
+        response.success,
+        response.data.as_ref(),
+    ) && !wait_for_daemon_exit(session, shutdown_timeout)
+    {
+        response.success = false;
+        response.code = Some("daemon_shutdown_unconfirmed".to_string());
+        response.error = Some(
+            "Browser close was confirmed, but timed out waiting for daemon shutdown; \
+             daemon shutdown is unconfirmed. The command was not retried."
+                .to_string(),
+        );
+        if let Some(data) = response.data.as_mut() {
+            data["daemonShutdownConfirmed"] = json!(false);
+        }
+    }
+    Ok(response)
 }
 
 /// Retry transient errors (EAGAIN/EWOULDBLOCK/connection issues). Once a
@@ -1258,6 +1384,224 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1, "request was re-sent");
         assert!(!resp.success);
         assert_eq!(resp.code.as_deref(), Some("outcome_unknown"));
+    }
+
+    #[cfg(unix)]
+    fn read_fake_daemon_request(
+        mut stream: &std::os::unix::net::UnixStream,
+        timeout: Duration,
+    ) -> Option<Value> {
+        stream.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + timeout;
+        let mut line = Vec::new();
+        loop {
+            assert!(Instant::now() < deadline, "Fake daemon request timed out");
+            let mut byte = [0];
+            match stream.read(&mut byte) {
+                Ok(0) => {
+                    assert!(
+                        line.is_empty(),
+                        "Fake daemon received an incomplete request"
+                    );
+                    return None;
+                }
+                Ok(_) => {
+                    line.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        let request = serde_json::from_slice(&line).unwrap();
+                        stream.set_nonblocking(false).unwrap();
+                        return Some(request);
+                    }
+                    assert!(line.len() < 65536, "Fake daemon request is too large");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    assert!(
+                        line.is_empty(),
+                        "Fake daemon peer closed an incomplete request"
+                    );
+                    return None;
+                }
+                Err(error) => panic!("Fake daemon request read failed: {}", error),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn send_to_lingering_daemon(
+        action: &str,
+        reply: Value,
+        shutdown_timeout: Duration,
+        linger: Duration,
+    ) -> (Response, bool, usize, Duration) {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+
+        let dir = tempfile::Builder::new()
+            .prefix("ab-close-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        let session = "close-handshake";
+        let socket_path = get_socket_path(session);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let daemon_stopped = stopped.clone();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let daemon_action = action.to_string();
+        let daemon = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_fake_daemon_request(&stream, Duration::from_secs(1))
+                .expect("Expected initial close request");
+            assert_eq!(request["action"], daemon_action);
+            writeln!(stream, "{}", reply).unwrap();
+            drop(stream);
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + linger;
+            let mut requests = 1;
+            while Instant::now() < deadline && stop_rx.try_recv().is_err() {
+                if let Ok((stream, _)) = listener.accept() {
+                    if read_fake_daemon_request(&stream, Duration::from_millis(50)).is_some() {
+                        requests += 1;
+                    }
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            daemon_stopped.store(true, Ordering::SeqCst);
+            drop(listener);
+            requests
+        });
+
+        let start = Instant::now();
+        let response = send_command_with_shutdown_timeout(
+            json!({"id": "close-handshake", "action": action}),
+            session,
+            shutdown_timeout,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        let exited_before_return = stopped.load(Ordering::SeqCst);
+        let _ = stop_tx.send(());
+        let requests = daemon.join().unwrap();
+        (response, exited_before_return, requests, elapsed)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn confirmed_close_waits_for_daemon_exit() {
+        for (action, data) in [
+            ("close", json!({"closed": true})),
+            (INTERNAL_DAEMON_SHUTDOWN_ACTION, json!({"closed": true})),
+            (
+                "confirm",
+                json!({
+                    "confirmed": true,
+                    "action": "close",
+                    "result": {"success": true, "data": {"closed": true}}
+                }),
+            ),
+        ] {
+            let (response, exited, requests, elapsed) = send_to_lingering_daemon(
+                action,
+                json!({"success": true, "data": data}),
+                Duration::from_secs(2),
+                Duration::from_millis(150),
+            );
+            assert!(response.success);
+            assert!(exited, "returned before daemon exit for {}", action);
+            assert!(elapsed >= Duration::from_millis(150));
+            assert_eq!(response.data, Some(data));
+            assert_eq!(requests, 1);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn confirmed_close_timeout_preserves_proof_without_resending() {
+        for (action, data) in [
+            ("close", json!({"closed": true})),
+            (INTERNAL_DAEMON_SHUTDOWN_ACTION, json!({"closed": true})),
+            (
+                "confirm",
+                json!({"result": {"success": true, "data": {"closed": true}}}),
+            ),
+        ] {
+            let (response, exited, requests, elapsed) = send_to_lingering_daemon(
+                action,
+                json!({"success": true, "data": data}),
+                Duration::from_millis(20),
+                Duration::from_secs(2),
+            );
+            assert!(!response.success);
+            assert_eq!(
+                response.code.as_deref(),
+                Some("daemon_shutdown_unconfirmed")
+            );
+            let mut expected = data;
+            expected["daemonShutdownConfirmed"] = json!(false);
+            assert_eq!(response.data, Some(expected));
+            assert!(!exited);
+            assert_eq!(requests, 1);
+            assert!(elapsed < Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn incomplete_or_failed_close_does_not_wait_for_daemon_exit() {
+        for (action, reply) in [
+            (
+                "close",
+                json!({"success": true, "data": {"confirmation_required": true}}),
+            ),
+            ("close", json!({"success": false, "error": "denied"})),
+            (
+                "close",
+                json!({"success": false, "error": "close failed", "data": {"closed": true}}),
+            ),
+            (
+                "close",
+                json!({"success": false, "code": "outcome_unknown"}),
+            ),
+            (
+                "confirm",
+                json!({"success": true, "data": {"result": {"success": false, "data": {"closed": true}}}}),
+            ),
+            (
+                "confirm",
+                json!({"success": true, "data": {"result": {"success": true, "data": {"confirmation_required": true}}}}),
+            ),
+            (
+                "tab_close",
+                json!({"success": true, "data": {"closed": true}}),
+            ),
+        ] {
+            let (response, exited, requests, _) = send_to_lingering_daemon(
+                action,
+                reply.clone(),
+                Duration::ZERO,
+                Duration::from_secs(2),
+            );
+            assert_eq!(response.success, reply["success"].as_bool().unwrap());
+            assert_eq!(
+                response.code.as_deref(),
+                reply.get("code").and_then(Value::as_str)
+            );
+            assert_eq!(response.data.as_ref(), reply.get("data"));
+            assert!(!exited);
+            assert_eq!(requests, 1);
+        }
     }
 
     /// In-memory stream: accepts at most `accept` bytes, then fails writes
@@ -1568,6 +1912,178 @@ mod tests {
             no_auto_dialog,
             plugins: None,
         }
+    }
+
+    #[cfg(unix)]
+    fn ensure_with_fake_work_mode_daemon(
+        data: Value,
+        success: bool,
+        work_mode: Option<&str>,
+        version_matches: bool,
+        config_matches: bool,
+    ) -> (Result<DaemonResult, String>, Vec<Value>) {
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc;
+
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        let session = "mode-capability";
+        let opts = test_daemon_options(None, false, None);
+        let version = if version_matches {
+            env!("CARGO_PKG_VERSION")
+        } else {
+            "0.0.0-old"
+        };
+        fs::write(get_version_path(session), version).unwrap();
+        let config = if config_matches {
+            daemon_config_fingerprint(&opts)
+        } else {
+            "different-config".to_string()
+        };
+        fs::write(get_config_path(session), &config).unwrap();
+        let listener = UnixListener::bind(get_socket_path(session)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let daemon = thread::spawn(move || {
+            let mut requests = Vec::new();
+            while stop_rx.try_recv().is_err() {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let Some(cmd) = read_fake_daemon_request(&stream, Duration::from_secs(1))
+                        else {
+                            continue;
+                        };
+                        let reply = json!({
+                            "id": cmd["id"],
+                            "success": success,
+                            "data": data,
+                        });
+                        requests.push(cmd);
+                        writeln!(stream, "{}", reply).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("Fake daemon accept failed: {}", error),
+                }
+            }
+            requests
+        });
+
+        let result = ensure_daemon_with_work_mode(session, &opts, work_mode);
+        stop_tx.send(()).unwrap();
+        let requests = daemon.join().unwrap();
+        assert_eq!(
+            fs::read_to_string(get_version_path(session)).unwrap(),
+            version
+        );
+        assert_eq!(
+            fs::read_to_string(get_config_path(session)).unwrap(),
+            config
+        );
+        assert!(get_socket_path(session).exists());
+        (result, requests)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_work_mode_capability_accepts_explicit_policy_version() {
+        let (result, requests) = ensure_with_fake_work_mode_daemon(
+            json!({"workModePolicyVersion": 1}),
+            true,
+            Some("background"),
+            true,
+            true,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            requests,
+            vec![json!({
+                "id": "work-mode-capability-check", "action": "session_info",
+            })]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_work_mode_capability_rejects_unknown_before_version_or_config_restart() {
+        for marker in [
+            Value::Null,
+            json!(0),
+            json!(2),
+            json!("1"),
+            json!(true),
+            json!(1.5),
+        ] {
+            for (version_matches, config_matches) in [(true, true), (false, true), (true, false)] {
+                let data = if marker.is_null() {
+                    json!({"browserLaunched": false})
+                } else {
+                    json!({"browserLaunched": false, "workModePolicyVersion": marker})
+                };
+                let (result, requests) = ensure_with_fake_work_mode_daemon(
+                    data,
+                    true,
+                    Some("collaboration"),
+                    version_matches,
+                    config_matches,
+                );
+                assert!(result.err().unwrap().contains("workModePolicyVersion: 1"));
+                assert_eq!(
+                    requests,
+                    vec![json!({
+                        "id": "work-mode-capability-check", "action": "session_info",
+                    })],
+                    "must reject before restart checks or shutdown commands"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_work_mode_capability_rejects_failed_response() {
+        let (result, requests) = ensure_with_fake_work_mode_daemon(
+            json!({"workModePolicyVersion": 1}),
+            false,
+            Some("background"),
+            true,
+            true,
+        );
+        assert!(result.is_err());
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_no_work_mode_skips_capability_handshake() {
+        let (result, requests) =
+            ensure_with_fake_work_mode_daemon(json!({}), true, None, true, true);
+        assert!(result.is_ok());
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn test_work_mode_restart_checks_fail_closed() {
+        assert!(validate_work_mode_restart(&json!({}), None).is_err());
+        assert!(validate_work_mode_restart(
+            &json!({"browserLaunched": true, "workMode": "background"}),
+            None
+        )
+        .is_err());
+        assert!(validate_work_mode_restart(
+            &json!({"browserLaunched": true}),
+            Some("collaboration")
+        )
+        .is_err());
+        assert!(validate_work_mode_restart(&json!({"browserLaunched": true}), None).is_ok());
+        assert!(validate_work_mode_restart(
+            &json!({"browserLaunched": false, "workMode": "background"}),
+            Some("collaboration")
+        )
+        .is_ok());
     }
 
     #[test]

@@ -7,6 +7,7 @@ Multiple isolated browser sessions with state persistence and concurrent browsin
 ## Contents
 
 - [Named Sessions](#named-sessions)
+- [Browser Work Modes](#browser-work-modes)
 - [Session Isolation Properties](#session-isolation-properties)
 - [Tab Pinning in a Shared Browser](#tab-pinning-in-a-shared-browser)
 - [Session State Persistence](#session-state-persistence)
@@ -42,6 +43,31 @@ agent-browser --session public open https://example.com
 agent-browser --session auth fill @e1 "user@example.com"
 agent-browser --session public get text body
 ```
+
+## Browser Work Modes
+
+Use `--session <name> --work-mode collaboration|background` to protect an owned nondefault session's local Chrome launch policy. Select intent using the [core skill](../SKILL.md#choose-a-browser-work-mode): collaboration is headed, background is headless. MCP tools accept the same policy via the common `workMode` option and nondefault `session`.
+
+```bash
+agent-browser --session research --work-mode background open https://example.com
+agent-browser --session research session info --json  # Inherits the mode
+agent-browser --session research close               # Releases the mode
+agent-browser --session research --work-mode collaboration open https://example.com
+```
+
+When using authenticated persistence, keep the same restore key and full application/account checks on every call, including these inspection and close commands. Record mode with session identity, but do not confuse it with saved authentication: policy lives in the daemon, survives omission on later calls, and is released by explicit close or daemon exit. Reassert it for a fresh daemon.
+
+Mode overrides `headed` config/environment defaults; explicit opposite `--headed true|false` is an error even when the mode is inherited. While a protected browser is live, mode changes, adoption of an unprotected browser, launch configuration changes requiring relaunch, restore-key changes, and daemon fingerprint/version reconfiguration cannot implicitly close it. Resolve the conflict, then explicitly close only your owned session with any required authorization before reopening. Do not bypass protection with a kill/restart. If manual login requires moving from background to collaboration, make this transition explicit and retain the existing verified checkpoint flow.
+
+Explicit `--work-mode` requires a read-only `session_info` capability handshake before existing-daemon version/configuration restart checks and after a fresh daemon is ready. Native `session_info` advertises `data.workModePolicyVersion: 1`; a missing/wrong marker or failed handshake rejects opt-in without killing, restarting, or mutating the daemon. Matching versions or source alone do not establish capability. Without an explicit mode, the existing path is unchanged. Explicit `close` cleanup remains available.
+
+Work-mode cleanup via `close` still obeys action-policy and confirmation rules. Batch applies local launch configuration per inner command, so an explicit `close` can release the old mode before the next command reconfigures the browser. Use `--bail` to stop if close is denied. `chat` rejects `--work-mode` before making model requests because propagation to browser tool calls is not yet supported; use direct CLI or MCP browser tools for protected sessions.
+
+Only locally launched Chrome is supported. Opt-in rejects external CDP, providers, auto-connect, profiles, other engines, launch-mutator plugins, and browser arguments overriding visibility or attachment. Background rejects extensions. Conflicting config/environment settings must also be removed; omitting the corresponding CLI flag is insufficient. Linux collaboration requires an existing `DISPLAY` and disables automatic private Xvfb. Neither the policy nor display presence verifies physical human visibility.
+
+`session info --json` exposes `workMode` and `effectiveMode`, both at the top level of `data` and in `data.effectiveLaunch`. Browser response `data.lifecycle` and its `effectiveLaunch` carry the same fields. Values are `collaboration`/`background` and `headed`/`headless`, respectively, or `null` without a policy. These describe the effective policy, not proof of a visible window; inspect `browserLaunched` separately.
+
+No new environment variable or config key is provided. Sessions that never opt in keep existing behavior. Use a deliberately built fork binary and matching bundled skills; editing source or installing the upstream CLI does not deploy this feature or migrate live daemons.
 
 ## Session Isolation Properties
 
@@ -186,6 +212,12 @@ agent-browser --session auth close
 # List active sessions
 agent-browser session list
 ```
+
+After a successful confirmed browser close, the shared CLI/MCP send path waits up to 5 seconds for the daemon endpoint to stop accepting connections. This includes close inside batch, close executed by `confirm`, and internal shutdown. After success, reopen immediately without an extra sleep. Endpoint confirmation prevents the old daemon from accepting the next launch and then disconnecting; it is not a fixed-delay workaround.
+
+A timeout returns `success: false`, code `daemon_shutdown_unconfirmed`, and `data.daemonShutdownConfirmed: false` while preserving the original `closed: true` proof, including nested confirmation results. Browser close is confirmed, but daemon shutdown is not. The handshake does not kill, resend, or auto-launch; do not continue a work-mode transition on this failure. Confirmation prompts, denials, errors, and `outcome_unknown` do not trigger the wait. Preserve the no-resend rule for unknown mutations: reconcile their effects before considering another action.
+
+Report the actual work mode, completed work, and any required user handoff concisely. Do not report a completed transition from a confirmation prompt or shutdown timeout, or claim physical visibility from headed policy alone.
 
 ## Best Practices
 

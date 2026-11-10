@@ -2,7 +2,7 @@
 
 Browser automation CLI for AI agents. Fast native Rust CLI.
 
-This personal fork, [x12315/agent-browser](https://github.com/x12315/agent-browser/tree/fix/login-session-reuse), adds verified login checkpoints and task-scoped authentication reuse on top of v0.39.1. It is not an official npm release. Installing the upstream package or only the discovery stub does not activate these changes; use a deliberately built fork binary and its matching bundled skills. Existing browser daemons are not restarted or migrated automatically.
+This personal fork, [x12315/agent-browser](https://github.com/x12315/agent-browser/tree/fix/login-session-reuse), adds verified login checkpoints, task-scoped authentication reuse, and explicit browser work modes on top of v0.39.1. It is not an official npm release. Installing the upstream package or only the discovery stub does not activate these changes; use a deliberately built fork binary and its matching bundled skills. Existing browser daemons are not restarted or migrated automatically.
 
 <p>
   <a href="https://vercel.com/labs#labs-products"><img alt="Vercel Labs Product" src="https://img.shields.io/badge/LABS-PRODUCT-0a0a0a.svg?style=for-the-badge&amp;logo=Vercel&amp;labelColor=000000" height="28"></a>
@@ -11,6 +11,10 @@ This personal fork, [x12315/agent-browser](https://github.com/x12315/agent-brows
   <a href="https://www.npmjs.com/package/agent-browser"><img alt="npm downloads per month: agent-browser" src="https://img.shields.io/npm/dm/agent-browser.svg?style=for-the-badge&amp;labelColor=000000&amp;label=npm%20downloads" height="28"></a>
   <a href="https://skills.sh/vercel-labs/agent-browser"><img alt="skills.sh" src="https://skills.sh/b/vercel-labs/agent-browser?style=for-the-badge" height="28"></a>
 </p>
+
+## Personal fork work-mode build
+
+For the pinned GitHub source, verified macOS ARM64 bundle and parallel installation that preserves the normal CLI and live sessions, see [GitHub work-mode distribution](docs/work-mode-distribution.md). This is a native CLI with matching Skills, not a Pi Extension; upstream npm installation is not a substitute for this fork's binary.
 
 ## Installation
 
@@ -622,7 +626,7 @@ Common tools include:
 - `agent_browser_eval`
 - `agent_browser_close`
 
-Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, and `allowedDomains`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.
+Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, and `allowedDomains`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. The common `workMode` option accepts `collaboration` or `background` and maps to `--work-mode`; supply a nondefault `session`. It uses the same sticky policy, conflict checks, and explicit-close requirement as the CLI (see [Browser work modes](#browser-work-modes)). Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.
 
 Example MCP client config:
 
@@ -780,6 +784,36 @@ Each session has its own:
 - Cookies and storage
 - Navigation history
 - Authentication state
+
+### Confirmed close and reopen
+
+The shared CLI/MCP send path waits up to 5 seconds after a successful, confirmed browser close for the daemon endpoint to stop accepting connections. This includes close inside batch, close executed by `confirm`, and internal shutdown. After success, the next `open` needs no extra sleep. This checks endpoint shutdown rather than relying on a fixed delay that could let the old daemon accept a new launch and then disconnect.
+
+A timeout returns `success: false`, code `daemon_shutdown_unconfirmed`, and `data.daemonShutdownConfirmed: false`, preserving the original `closed: true` proof (including nested confirmation results). The browser close is confirmed, but daemon shutdown is not; the handshake does not kill, resend, or auto-launch. Confirmation prompts, denials, errors, and `outcome_unknown` do not trigger this wait. Never resend a mutation with an unknown outcome without first reconciling its effects.
+
+### Browser work modes
+
+Agents should briefly report the actual mode, completed work, and any required handoff. Do not claim human visibility from headed policy alone or proceed with a mode transition after an unconfirmed shutdown.
+
+Opt in with `--session <name> --work-mode collaboration|background`. `collaboration` launches local headed Chrome for human/agent collaboration; `background` launches local headless Chrome for autonomous tasks. A nondefault named session is required. Agents should choose automatically when intent is clear: use collaboration for watching together, manual login, or handoff, and background for routine autonomous reading, extraction, screenshots, or testing. Ask only when ambiguity materially changes human involvement. The bundled core skill owns this selection guidance; no separate wrapper or semantic classifier is required.
+
+```bash
+agent-browser --session research --work-mode background open https://example.com
+agent-browser --session research snapshot -i  # Inherits background
+agent-browser --session research session info --json
+agent-browser --session research close       # Releases the mode
+agent-browser --session research --work-mode collaboration open https://example.com
+```
+
+The daemon retains the mode when subsequent calls omit it. It overrides `headed` config/environment defaults, but an explicit opposite `--headed true|false` fails. A live protected browser cannot be adopted from an unprotected session, switched to another mode, or implicitly closed/relaunched by launch configuration, restore-key, or daemon fingerprint changes. Close your owned session explicitly before reconfiguring; do not close another task's browser to recover. This is daemon-lifetime policy, not persisted authentication or a live-daemon migration. Existing CLI behavior is unchanged for sessions that never opt in; there is no new environment variable or config key.
+
+Explicit `--work-mode` requires a read-only `session_info` capability handshake before existing-daemon version/configuration restart checks and after a fresh daemon is ready. Native `session_info` advertises `data.workModePolicyVersion: 1`; a missing/wrong marker or failed handshake rejects opt-in without killing, restarting, or mutating the daemon. Matching versions or source alone do not prove capability. Without an explicit mode, the existing path is unchanged. Explicit `close` cleanup remains available under normal policy rules.
+
+Batch applies local launch configuration at each inner command, so an explicit `close` can release an old mode before the next command. `chat` currently rejects `--work-mode` before making model requests; use direct CLI or MCP browser tools for protected sessions. Work-mode cleanup still obeys action-policy and confirmation rules.
+
+Opt-in supports only locally launched Chrome, not external CDP, providers, auto-connect, profiles, other engines, or launch-mutator plugins. Browser arguments overriding visibility or attachment are rejected, and background mode rejects extensions. Linux collaboration requires an existing `DISPLAY` and never starts private automatic Xvfb. Headed mode and display presence do not verify that a human can physically see the window.
+
+`session info --json` and response `lifecycle` diagnostics expose `workMode` (`collaboration` or `background`) and `effectiveMode` (`headed` or `headless`), including their `effectiveLaunch` objects; both are `null` without an active policy. Use a deliberately built fork binary with its matching bundled skills: source edits, upstream installations, and discovery stubs do not upgrade the installed CLI or migrate existing daemons.
 
 ### Tab pinning
 
@@ -1097,6 +1131,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--screenshot-quality <n>` | JPEG quality 0-100 (or `AGENT_BROWSER_SCREENSHOT_QUALITY` env) |
 | `--screenshot-format <fmt>` | Screenshot format: `png`, `jpeg` (or `AGENT_BROWSER_SCREENSHOT_FORMAT` env) |
 | `--headed` | Show browser window on the interactive desktop (or `AGENT_BROWSER_HEADED` env) |
+| `--work-mode <mode>` | Opt-in sticky `collaboration` (headed) or `background` (headless) local Chrome policy; requires a nondefault named session; see [Browser work modes](#browser-work-modes) |
 | `--webgpu` | Enable WebGPU; SwiftShader software Vulkan on Linux, no GPU required (or `AGENT_BROWSER_WEBGPU` env) |
 | `--no-webmcp` | Disable experimental WebMCP support, which is enabled by default for locally launched Chrome (or `AGENT_BROWSER_NO_WEBMCP` env) |
 | `--cdp <port\|url>` | Connect via Chrome DevTools Protocol (port or WebSocket URL) |
@@ -1383,9 +1418,9 @@ agent-browser open example.com --headed
 
 This opens a visible browser window instead of running headless.
 
-On Linux hosts with no display (servers, containers), `--headed` still works: when `DISPLAY` is unset and Xvfb is installed, agent-browser starts a private virtual display for the browser and cleans it up on close (opt out with `AGENT_BROWSER_NO_XVFB=1`). Needed for [WebGPU screenshots](#webgpu), and useful for extensions that misbehave headless.
+Outside opt-in work modes, on Linux hosts with no display (servers, containers), `--headed` still works: when `DISPLAY` is unset and Xvfb is installed, agent-browser starts a private virtual display for the browser and cleans it up on close (opt out with `AGENT_BROWSER_NO_XVFB=1`). Needed for [WebGPU screenshots](#webgpu), and useful for extensions that misbehave headless.
 
-> **Note:** Browser extensions work in both headed and headless mode (Chrome's `--headless=new`).
+> **Note:** Opt-in background work mode rejects extensions because agent-browser's extension launch path forces headed Chrome.
 
 ## WebGPU
 
@@ -1402,7 +1437,7 @@ On macOS and Windows this uses the hardware Metal/D3D backend. On Linux it route
 apt-get install -y libvulkan1 mesa-vulkan-drivers
 ```
 
-One upstream caveat: headless Chrome cannot capture WebGPU canvas presentation in screenshots on Windows and Linux (rendering and in-page readbacks work; the capture is black). Screenshots of WebGPU pages work headless on macOS; on Windows run `--headed` in a logged-in desktop session; on Linux just add `--headed` — when no `DISPLAY` is set and Xvfb is installed, agent-browser starts a private virtual display automatically (opt out with `AGENT_BROWSER_NO_XVFB=1`).
+One upstream caveat: headless Chrome cannot capture WebGPU canvas presentation in screenshots on Windows and Linux (rendering and in-page readbacks work; the capture is black). Screenshots of WebGPU pages work headless on macOS; on Windows run `--headed` in a logged-in desktop session; outside opt-in work modes on Linux, add `--headed` — when no `DISPLAY` is set and Xvfb is installed, agent-browser starts a private virtual display automatically (opt out with `AGENT_BROWSER_NO_XVFB=1`).
 
 Verify the full pipeline (adapter, render pass, and screenshot capture) with:
 

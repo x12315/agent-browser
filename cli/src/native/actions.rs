@@ -636,6 +636,8 @@ pub struct DaemonState {
     pub idle_activity: Arc<IdleActivity>,
     /// Hash of launch options used for the current browser, for relaunch detection.
     launch_hash: Option<u64>,
+    /// Explicit session policy, retained until a successful explicit close.
+    work_mode: Option<String>,
     effective_ca_cert: Option<EffectiveCaCert>,
     /// Whether browser-level auto-attach has been enabled for the current
     /// browser so top-level popups pause before their first request.
@@ -760,6 +762,7 @@ impl DaemonState {
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
             launch_hash: None,
+            work_mode: None,
             effective_ca_cert: None,
             network_auto_attach_installed: false,
             engine: env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
@@ -2384,6 +2387,12 @@ fn has_active_browser_session(state: &DaemonState) -> bool {
 }
 
 async fn close_before_implicit_relaunch(state: &mut DaemonState) -> Result<(), String> {
+    if state.work_mode.is_some() && has_active_browser_session(state) {
+        return Err(
+            "Work-mode browser is active; close the session explicitly before relaunching"
+                .to_string(),
+        );
+    }
     let browser_use = state
         .active_provider_session
         .as_ref()
@@ -2734,8 +2743,151 @@ fn policy_actions_for_command(
     actions
 }
 
+fn has_work_mode_browser(state: &DaemonState) -> bool {
+    has_active_browser_session(state)
+        || state.webdriver_backend.is_some()
+        || state.safari_driver.is_some()
+}
+
+fn effective_work_mode(state: &DaemonState) -> Option<&'static str> {
+    state.work_mode.as_deref().map(|mode| {
+        if mode == "background" {
+            "headless"
+        } else {
+            "headed"
+        }
+    })
+}
+
+fn apply_work_mode(cmd: &Value, state: &mut DaemonState) -> Result<(), String> {
+    if cmd.get("action").and_then(Value::as_str) == Some("close") {
+        return Ok(());
+    }
+    let requested = match cmd.get("workMode") {
+        None => None,
+        Some(Value::String(mode)) if matches!(mode.as_str(), "collaboration" | "background") => {
+            Some(mode.as_str())
+        }
+        Some(_) => return Err("workMode must be collaboration or background".to_string()),
+    };
+    let active = has_work_mode_browser(state);
+    if let Some(mode) = requested {
+        if state.session_id == "default" || state.session_id.is_empty() {
+            return Err("Work mode requires a nondefault named --session".to_string());
+        }
+        if active && state.work_mode.as_deref() != Some(mode) {
+            return Err("Cannot change work mode or adopt an unprotected live browser. Close the session explicitly first.".to_string());
+        }
+    }
+    let Some(mode) = requested.or(state.work_mode.as_deref()) else {
+        return Ok(());
+    };
+    if cmd
+        .get("requestedHeaded")
+        .and_then(Value::as_bool)
+        .is_some_and(|headed| headed != (mode == "collaboration"))
+    {
+        return Err("Explicit --headed conflicts with the session work mode".to_string());
+    }
+    let action = cmd.get("action").and_then(Value::as_str).unwrap_or("");
+    if active
+        && (command_changes_restore_key(cmd, state) || action == INTERNAL_DAEMON_SHUTDOWN_ACTION)
+    {
+        return Err("Work-mode browser is active; close the session explicitly before changing restore configuration or restarting the daemon".to_string());
+    }
+    if action == "launch" || (!skip_launch_action(action) && !active) {
+        validate_work_mode_launch_for(cmd, mode)?;
+    }
+    if let Some(mode) = requested {
+        state.work_mode = Some(mode.to_string());
+    }
+    Ok(())
+}
+
+fn validate_work_mode_launch(cmd: &Value, state: &DaemonState) -> Result<(), String> {
+    if let Some(mode) = state.work_mode.as_deref() {
+        validate_work_mode_launch_for(cmd, mode)?;
+    }
+    Ok(())
+}
+
+fn validate_work_mode_launch_for(cmd: &Value, mode: &str) -> Result<(), String> {
+    let external = ["cdpUrl", "cdpPort", "provider", "profile"]
+        .iter()
+        .any(|key| cmd.get(*key).is_some_and(|v| !v.is_null()))
+        || cmd.get("autoConnect").and_then(Value::as_bool) == Some(true)
+        || [
+            "AGENT_BROWSER_CDP",
+            "AGENT_BROWSER_PROVIDER",
+            "AGENT_BROWSER_PROFILE",
+        ]
+        .iter()
+        .any(|key| env::var(key).is_ok())
+        || env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok();
+    let engine = cmd
+        .get("engine")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| env::var("AGENT_BROWSER_ENGINE").ok());
+    if external || engine.as_deref().is_some_and(|engine| engine != "chrome") {
+        return Err("Work mode supports only locally launched Chrome: CDP, providers, auto-connect, profiles, and other engines are unsupported".to_string());
+    }
+    if !crate::plugins::resolved_plugins_with_capability(
+        &plugins_from_command_or_env(cmd),
+        crate::plugins::CAPABILITY_LAUNCH_MUTATE,
+    )
+    .is_empty()
+    {
+        return Err("Work mode does not support launch-mutator plugins".to_string());
+    }
+    let env_options = launch_options_from_env();
+    let extensions = string_array_from_command(cmd, "extensions").or(env_options.extensions);
+    if mode == "background" && extensions.is_some_and(|extensions| !extensions.is_empty()) {
+        return Err("Background work mode does not support extensions because extensions force headed Chrome".to_string());
+    }
+    let args = string_array_from_command(cmd, "args").unwrap_or(env_options.args);
+    if args.iter().any(|arg| {
+        [
+            "--headless",
+            "--remote-debugging",
+            "--user-data-dir",
+            "--display",
+            "--ozone-platform",
+            "--no-startup-window",
+        ]
+        .iter()
+        .any(|prefix| arg.starts_with(prefix))
+    }) {
+        return Err(
+            "Work mode does not support browser arguments that override visibility or attachment"
+                .to_string(),
+        );
+    }
+    if cmd.get("headedDefault").and_then(Value::as_bool) != Some(true)
+        && cmd
+            .get("headless")
+            .and_then(Value::as_bool)
+            .is_some_and(|headless| headless != (mode == "background"))
+    {
+        return Err(
+            "Explicit headless/headed choice conflicts with the session work mode".to_string(),
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if mode == "collaboration"
+        && env::var("DISPLAY").map_or(true, |display| display.trim().is_empty())
+    {
+        return Err("Collaboration requires an existing DISPLAY on Linux; private automatic Xvfb is not user-visible. Display presence does not certify physical visibility.".to_string());
+    }
+    Ok(())
+}
+
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let request_id = cmd.get("id").and_then(Value::as_str).unwrap_or("");
+    if let Err(err) = apply_work_mode(cmd, state) {
+        return error_response(request_id, &err);
+    }
     // Unlike normal auth login, no-navigation mode must never launch a
     // browser or manufacture an about:blank page to satisfy the command.
     let auth_login_no_navigate = action == "auth_login"
@@ -4137,7 +4289,12 @@ async fn auto_launch_inner(
     if has_active_browser_session(state) {
         close_before_implicit_relaunch(state).await?;
     }
+    validate_work_mode_launch(&json!({}), state)?;
     let mut options = launch_options_from_env();
+    if let Some(mode) = state.work_mode.as_deref() {
+        options.headless = mode == "background";
+        options.no_xvfb = true;
+    }
     let effective_ca_cert = state.effective_ca_cert.clone();
     apply_effective_ca_cert(&mut options, &effective_ca_cert);
     state.plugin_init_scripts.clear();
@@ -4951,14 +5108,20 @@ async fn handle_launch_with_deadline(
 }
 
 async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    validate_work_mode_launch(cmd, state)?;
     let effective_ca_cert = resolve_effective_ca_cert(cmd, state)?;
     // Absent field falls back to the daemon's spawn-time env (mirrors
     // hideScrollbars/webgpu), keeping the launch hash stable when follow-up
     // commands send launch envelopes without an explicit headed choice.
-    let headless = cmd
-        .get("headless")
-        .and_then(|v| v.as_bool())
-        .unwrap_or_else(|| !headed_from_env());
+    let headless = state
+        .work_mode
+        .as_deref()
+        .map(|mode| mode == "background")
+        .unwrap_or_else(|| {
+            cmd.get("headless")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| !headed_from_env())
+        });
     let cdp_url = cmd.get("cdpUrl").and_then(|v| v.as_str());
     let cdp_port = cmd.get("cdpPort").and_then(|v| v.as_u64());
     let auto_connect = cmd
@@ -5095,7 +5258,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
                     Ok("1" | "true" | "yes")
                 )
             }),
-        no_xvfb: no_xvfb_from_launch_cmd(cmd),
+        no_xvfb: state.work_mode.is_some() || no_xvfb_from_launch_cmd(cmd),
         restrict_webrtc,
     };
     if engine.as_deref() == Some("obscura") {
@@ -5128,15 +5291,6 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         restore_key: restore_key.as_deref(),
         storage_state,
     })?;
-
-    if let Some(domains) = requested_allowed_domains {
-        let mut filter = state.domain_filter.write().await;
-        *filter = if domains.is_empty() {
-            None
-        } else {
-            Some(DomainFilter::new(&domains.join(",")))
-        };
-    }
 
     let (connection_kind, connection_target) =
         launch_connection_identity(cdp_url, cdp_port, auto_connect, provider_name);
@@ -5172,6 +5326,17 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
     let had_browser_before_launch =
         state.browser.is_some() || state.active_provider_session.is_some();
 
+    if needs_relaunch && had_browser_before_launch && state.work_mode.is_some() {
+        return Err("Work-mode browser is active; launch configuration changed or connection is uncertain. Close the session explicitly before relaunching.".to_string());
+    }
+    if let Some(domains) = requested_allowed_domains {
+        let mut filter = state.domain_filter.write().await;
+        *filter = if domains.is_empty() {
+            None
+        } else {
+            Some(DomainFilter::new(&domains.join(",")))
+        };
+    }
     if needs_relaunch {
         if local_launch {
             if let Some(ref ca) = effective_ca_cert {
@@ -5769,6 +5934,7 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
     }
 
     state.ref_map.invalidate_all_documents();
+    state.work_mode = None;
     match save_result {
         Ok(Some(path)) => Ok(json!({
             "closed": true,
@@ -7256,16 +7422,21 @@ async fn handle_errors(state: &DaemonState) -> Result<Value, String> {
 async fn handle_session_info(state: &DaemonState) -> Result<Value, String> {
     Ok(json!({
         "session": state.session_id,
+        "workModePolicyVersion": 1,
+        "workMode": state.work_mode,
+        "effectiveMode": effective_work_mode(state),
         "namespace": env::var("AGENT_BROWSER_NAMESPACE").ok(),
         "socketDir": get_socket_dir().to_string_lossy(),
         "backgroundPid": std::process::id(),
-        "browserLaunched": state.browser.is_some(),
+        "browserLaunched": has_work_mode_browser(state),
         "pageCount": state.browser.as_ref().map(|mgr| mgr.page_count()).unwrap_or(0),
         "engine": state.engine,
         "launchHash": state.launch_hash,
         "compatibilityStatus": "current",
         "effectiveLaunch": {
-            "browserLaunched": state.browser.is_some(),
+            "workMode": state.work_mode,
+            "effectiveMode": effective_work_mode(state),
+            "browserLaunched": has_work_mode_browser(state),
             "engine": state.engine,
             "launchHash": state.launch_hash,
         },
@@ -13802,10 +13973,14 @@ fn inject_lifecycle(
             "launched": effective_launched,
             "relaunchedBrowser": effective_relaunched,
             "restartedBackground": false,
+            "workMode": state.work_mode,
+            "effectiveMode": effective_work_mode(state),
             "restoreStatus": state.restore_status,
             "saveStatus": state.restore_save_status,
             "effectiveLaunch": {
-                "browserLaunched": state.browser.is_some(),
+                "workMode": state.work_mode,
+                "effectiveMode": effective_work_mode(state),
+                "browserLaunched": has_work_mode_browser(state),
                 "engine": state.engine,
                 "launchHash": state.launch_hash,
             }
@@ -13852,6 +14027,168 @@ fn attach_tab_gone_data(resp: &mut Value, state: &DaemonState) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn session_info_advertises_work_mode_policy_without_selecting_mode() {
+        let mut state = DaemonState::new();
+        let resp = execute_command(
+            &json!({"id": "capability", "action": "session_info"}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["data"]["workModePolicyVersion"], 1);
+        assert!(state.work_mode.is_none());
+        assert!(!has_work_mode_browser(&state));
+    }
+
+    #[tokio::test]
+    async fn work_mode_is_sticky_and_close_releases_policy() {
+        let mut state = DaemonState::new();
+        state.session_id = "work-mode-unit".to_string();
+        let resp = execute_command(
+            &json!({"id": "1", "action": "session_info", "workMode": "background"}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["data"]["workMode"], "background");
+        assert_eq!(resp["data"]["effectiveMode"], "headless");
+        let resp = execute_command(&json!({"id": "2", "action": "session_info"}), &mut state).await;
+        assert_eq!(resp["data"]["lifecycle"]["workMode"], "background");
+        let resp = execute_command(
+            &json!({"id": "3", "action": "session_info", "requestedHeaded": true}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(resp["success"], false);
+        assert_eq!(state.work_mode.as_deref(), Some("background"));
+        let resp = execute_command(&json!({"id": "4", "action": "close", "workMode": "collaboration", "requestedHeaded": true}), &mut state).await;
+        assert_eq!(resp["success"], true);
+        assert!(state.work_mode.is_none());
+        assert!(apply_work_mode(
+            &json!({"action": "session_info", "workMode": "collaboration"}),
+            &mut state
+        )
+        .is_ok());
+        assert_eq!(effective_work_mode(&state), Some("headed"));
+    }
+
+    #[tokio::test]
+    async fn work_mode_close_keeps_policy_and_browser_until_authorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("policy.json");
+        let mut state = DaemonState::new();
+        state.session_id = "work-mode-close-policy".to_string();
+        state.work_mode = Some("background".to_string());
+        state.active_provider_session = Some(pending_browser_use_session());
+        state.confirm_actions = None;
+        let command = json!({
+            "id": "close-policy",
+            "action": "close",
+            "workMode": "collaboration",
+            "requestedHeaded": true
+        });
+        for rule in ["deny", "confirm"] {
+            fs::write(&policy_path, json!({(rule): ["close"]}).to_string()).unwrap();
+            state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
+            let resp = execute_command(&command, &mut state).await;
+            if rule == "deny" {
+                assert_eq!(resp["success"], false);
+                assert!(resp["error"].as_str().unwrap().contains("denied by policy"));
+                assert!(state.pending_confirmation.is_none());
+            } else {
+                assert_eq!(resp["data"]["confirmation_required"], true);
+                assert_eq!(state.pending_confirmation.as_ref().unwrap().cmd, command);
+            }
+            assert_eq!(state.work_mode.as_deref(), Some("background"));
+            assert!(state.active_provider_session.is_some());
+        }
+        state.policy = None;
+        state.pending_confirmation = None;
+        state.confirm_actions = Some(ConfirmActions {
+            categories: ["close".to_string()].into_iter().collect(),
+        });
+        let resp = execute_command(&command, &mut state).await;
+        assert_eq!(resp["data"]["confirmation_required"], true);
+        assert_eq!(state.work_mode.as_deref(), Some("background"));
+        assert!(state.active_provider_session.is_some());
+        let resp = execute_command(
+            &json!({"action": "deny", "confirmationId": "close-policy"}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(resp["success"], true);
+        assert_eq!(state.work_mode.as_deref(), Some("background"));
+        assert!(state.active_provider_session.is_some());
+    }
+
+    #[tokio::test]
+    async fn work_mode_requires_named_session_and_rejects_external_launches() {
+        let mut state = DaemonState::new();
+        state.session_id = "default".to_string();
+        assert!(apply_work_mode(
+            &json!({"action": "session_info", "workMode": "background"}),
+            &mut state
+        )
+        .is_err());
+        assert!(apply_work_mode(
+            &json!({"action": "session_info", "workMode": "invalid"}),
+            &mut state
+        )
+        .is_err());
+        for fields in [
+            json!({"cdpUrl": "ws://localhost:9222"}),
+            json!({"cdpPort": 9222}),
+            json!({"autoConnect": true}),
+            json!({"provider": "browserbase"}),
+            json!({"profile": "/tmp/profile"}),
+            json!({"engine": "lightpanda"}),
+        ] {
+            assert!(validate_work_mode_launch_for(&fields, "background")
+                .unwrap_err()
+                .contains("locally launched Chrome"));
+        }
+    }
+
+    #[test]
+    fn work_mode_rejects_visibility_override_inputs() {
+        let vars = [
+            "AGENT_BROWSER_CDP",
+            "AGENT_BROWSER_PROVIDER",
+            "AGENT_BROWSER_PROFILE",
+            "AGENT_BROWSER_AUTO_CONNECT",
+            "AGENT_BROWSER_ENGINE",
+            "AGENT_BROWSER_ARGS",
+            "AGENT_BROWSER_EXTENSIONS",
+            "AGENT_BROWSER_PLUGINS",
+            "DISPLAY",
+        ];
+        let guard = EnvGuard::new(&vars);
+        for var in vars {
+            guard.remove(var);
+        }
+        for command in [
+            json!({"headless": false}),
+            json!({"extensions": ["/tmp/extension"]}),
+            json!({"args": ["--headless=new"]}),
+            json!({"args": ["--user-data-dir=/tmp/profile"]}),
+        ] {
+            assert!(validate_work_mode_launch_for(&command, "background").is_err());
+        }
+        assert!(validate_work_mode_launch_for(
+            &json!({"headless": false, "headedDefault": true}),
+            "background"
+        )
+        .is_ok());
+        guard.set("AGENT_BROWSER_AUTO_CONNECT", "0");
+        assert!(validate_work_mode_launch_for(&json!({}), "background").is_err());
+        guard.remove("AGENT_BROWSER_AUTO_CONNECT");
+        #[cfg(target_os = "linux")]
+        assert!(validate_work_mode_launch_for(&json!({}), "collaboration")
+            .unwrap_err()
+            .contains("DISPLAY"));
+    }
+
     #[tokio::test]
     async fn test_auth_login_releases_remote_objects_after_failures() {
         use futures_util::{SinkExt, StreamExt};

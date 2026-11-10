@@ -28,6 +28,12 @@ agent-browser close           # Close browser (aliases: quit, exit)
 agent-browser connect 9222    # Connect to browser via CDP port
 ```
 
+### Confirmed browser close
+
+The shared CLI/MCP send path waits up to 5 seconds after a successful confirmed browser close for the daemon endpoint to stop accepting connections, including close inside batch, close executed by `confirm`, and internal shutdown. No extra sleep is needed before the next `open` after success. This is an endpoint check, not a fixed-delay workaround.
+
+Timeout returns `success: false`, code `daemon_shutdown_unconfirmed`, and `data.daemonShutdownConfirmed: false`, preserving the original `closed: true` proof (including nested confirmation results). It does not kill, resend, or auto-launch. Confirmation prompts, denials, errors, and `outcome_unknown` do not trigger the wait. Never blindly resend a mutation whose outcome is unknown; reconcile its effects first. For work-mode changes, do not continue after unconfirmed shutdown; report the actual mode, completed work, and any required handoff without claiming human visibility from headed policy alone.
+
 ### Pre-navigation setup (one-turn batch)
 
 ```bash
@@ -439,6 +445,12 @@ Common tools include:
 Tool calls use the same config files and environment variables as the CLI. Each tool accepts typed arguments plus `extraArgs` for advanced CLI flags and exact CLI parity. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally. Use the `session` tool argument or `AGENT_BROWSER_SESSION` to isolate browser state.
 
 ## Global Options
+
+Explicit `--work-mode` requires a read-only `session_info` handshake before existing-daemon version/configuration restart checks and after a fresh daemon is ready. Native `session_info` advertises `data.workModePolicyVersion: 1`; a missing/wrong marker or failed handshake rejects opt-in without kill, restart, or mutation. Matching versions or source alone are insufficient. Without an explicit mode, the existing path is unchanged. Explicit `close` cleanup remains available.
+
+Work-mode cleanup via `close` still obeys action-policy and confirmation rules. Batch applies local launch configuration per inner command, allowing an explicit `close` before reconfiguration; use `--bail` to stop if close is denied. `chat` rejects `--work-mode` before making model requests because propagation to browser tool calls is not yet supported; use direct CLI or MCP browser tools for protected sessions.
+
+`--work-mode collaboration|background` opts a nondefault named `--session` into a sticky local Chrome policy (headed/headless). Later omission inherits it; mode overrides headed defaults but explicit opposite `--headed` fails. Close explicitly before changing a protected live browser's mode or launch/daemon configuration. MCP's common `workMode` option delegates to the same CLI policy. See [Browser Work Modes](session-management.md#browser-work-modes) for unsupported launch paths, Linux display requirements, diagnostics, and fork deployment limits. No new environment/config default is added; sessions that never opt in are unchanged.
 
 ```bash
 agent-browser --session <name> ...    # Isolated browser session

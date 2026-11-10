@@ -2038,6 +2038,14 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         }),
     );
     props.insert(
+        "workMode".to_string(),
+        json!({
+            "type": "string",
+            "enum": ["collaboration", "background"],
+            "description": "Opt-in sticky native session policy: local headed Chrome for collaboration, local headless Chrome for background. Requires a nondefault named session; close before changing mode."
+        }),
+    );
+    props.insert(
         "idleTimeout".to_string(),
         json!({
             "type": "string",
@@ -2431,6 +2439,8 @@ fn call_tools_profiles(config: &McpConfig) -> Result<Value, ProtocolError> {
     }))
 }
 
+/// Delegate through the CLI, including its shared confirmed-close shutdown wait
+/// for close, batch, and confirm. Structured shutdown failures are forwarded intact.
 fn call_cli_tool(
     arguments: &Value,
     command_args: Vec<String>,
@@ -3841,6 +3851,15 @@ fn append_common_global_args(
         args.push(namespace);
     }
     append_session_args(args, session);
+    if let Some(mode) = optional_string(arguments, "workMode")? {
+        if !matches!(mode.as_str(), "collaboration" | "background") {
+            return Err(ProtocolError::invalid_params(
+                "workMode must be collaboration or background",
+            ));
+        }
+        args.push("--work-mode".to_string());
+        args.push(mode);
+    }
 
     if let Some(idle_timeout) = optional_string(arguments, "idleTimeout")? {
         args.push("--idle-timeout".to_string());
@@ -4821,6 +4840,56 @@ mod tests {
     }
 
     #[test]
+    fn common_work_mode_schema_and_cli_mapping_are_aligned() {
+        for tool in tools() {
+            assert_eq!(
+                tool["inputSchema"]["properties"]["workMode"]["enum"],
+                json!(["collaboration", "background"])
+            );
+        }
+        let mut args = Vec::new();
+        append_common_global_args(
+            &mut args,
+            &json!({"workMode": "background"}),
+            Some("mode-test"),
+        )
+        .unwrap();
+        args.extend([
+            "--headed".to_string(),
+            "false".to_string(),
+            "open".to_string(),
+        ]);
+        let flags = crate::flags::parse_flags(&args);
+        assert_eq!(flags.work_mode.as_deref(), Some("background"));
+        assert!(flags.cli_headed);
+        let command =
+            crate::commands::parse_command(&crate::flags::clean_args(&args), &flags).unwrap();
+        assert_eq!(command["workMode"], "background");
+        assert_eq!(command["requestedHeaded"], false);
+        assert!(
+            append_common_global_args(&mut Vec::new(), &json!({"workMode": "invalid"}), None)
+                .is_err()
+        );
+        assert!(
+            append_common_global_args(&mut Vec::new(), &json!({"workMode": true}), None).is_err()
+        );
+        let mut args = Vec::new();
+        append_common_global_args(
+            &mut args,
+            &json!({"workMode": "collaboration"}),
+            Some("mode-test"),
+        )
+        .unwrap();
+        args.extend([
+            "--headed".to_string(),
+            "false".to_string(),
+            "open".to_string(),
+        ]);
+        let flags = crate::flags::parse_flags(&args);
+        assert!(crate::commands::parse_command(&crate::flags::clean_args(&args), &flags).is_err());
+    }
+
+    #[test]
     fn common_global_args_use_equals_form_for_string_restore_key() {
         let mut args = Vec::new();
 
@@ -5347,6 +5416,32 @@ mod tests {
             result["structuredContent"]["response"]["code"],
             "outcome_unknown"
         );
+    }
+
+    #[test]
+    fn tool_result_preserves_unconfirmed_shutdown_and_close_proof() {
+        let failure = json!({
+            "success": false,
+            "code": "daemon_shutdown_unconfirmed",
+            "error": "Browser close confirmed; daemon shutdown unconfirmed",
+            "data": {"closed": true, "daemonShutdownConfirmed": false}
+        });
+        let batch = json!([{
+            "command": ["close"],
+            "success": false,
+            "code": failure["code"],
+            "error": failure["error"],
+            "result": failure["data"]
+        }]);
+        for response in [failure, batch] {
+            let result = tool_result_from_run(CliRun {
+                exit_code: Some(1),
+                stdout: response.to_string(),
+                stderr: String::new(),
+            });
+            assert_eq!(result["isError"], true);
+            assert_eq!(result["structuredContent"]["response"], response);
+        }
     }
 
     #[test]

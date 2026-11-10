@@ -1,0 +1,7 @@
+dist/sandbox-inputs/work-mode-source.tar.gz:/tmp/ahsb-push/work-mode-source.tar.gz
+dist/sandbox-inputs/rust-toolchain-cache.tar.gz:/tmp/ahsb-push/rust-toolchain-cache.tar.gz
+dist/sandbox-inputs/cargo-registry-cache.tar.gz:/tmp/ahsb-push/cargo-registry-cache.tar.gz
+dist/sandbox-inputs/rust-dependency-target-cache.tar.gz:/tmp/ahsb-push/rust-dependency-target-cache.tar.gz
+dist/sandbox-inputs/public-build-cache-manifest.json:/tmp/ahsb-push/public-build-cache-manifest.json
+test/sandbox/work-mode/guest.sh:/tmp/ahsb-push/guest.sh
+test/sandbox/work-mode/cli-smoke.py:/tmp/ahsb-push/cli-smoke.py

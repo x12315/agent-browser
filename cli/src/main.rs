@@ -34,8 +34,8 @@ use windows_sys::Win32::System::Threading::OpenProcess;
 
 use commands::{attach_ca_cert_to_launch_command, gen_id, parse_command, ParseError};
 use connection::{
-    cleanup_stale_files, daemon_unreachable, ensure_daemon, get_socket_dir, is_pid_alive,
-    send_command, walk_daemons, DaemonOptions, Response,
+    cleanup_stale_files, daemon_unreachable, get_socket_dir, is_pid_alive, send_command,
+    walk_daemons, DaemonOptions, Response,
 };
 use flags::{clean_args, parse_flags, Flags};
 use install::run_install;
@@ -290,7 +290,20 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
     None
 }
 
+fn chat_work_mode_error(flags: &Flags) -> Option<&'static str> {
+    flags
+        .work_mode
+        .as_ref()
+        .map(|_| "--work-mode is not supported by chat yet; use browser commands directly")
+}
+
 fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -> bool {
+    if matches!(
+        command.get("action").and_then(serde_json::Value::as_str),
+        Some("batch" | "close")
+    ) {
+        return false;
+    }
     (flags.headed
         || flags.cli_headed
         || flags.executable_path.is_some()
@@ -1591,6 +1604,14 @@ fn main() {
 
     // Handle chat command
     if clean.first().map(|s| s.as_str()) == Some("chat") {
+        if let Some(err) = chat_work_mode_error(&flags) {
+            if flags.json {
+                print_json_error(err);
+            } else {
+                eprintln!("{} {}", color::error_indicator(), err);
+            }
+            exit(1);
+        }
         let message = if clean.len() > 1 {
             Some(clean[1..].join(" "))
         } else {
@@ -1618,6 +1639,55 @@ fn main() {
             exit(1);
         }
     };
+    if cmd.get("action").and_then(serde_json::Value::as_str) == Some("close")
+        && connection::daemon_ready(&flags.session)
+        && (flags.work_mode.is_some()
+            || send_command(
+                json!({"id": gen_id(), "action": "session_info"}),
+                &flags.session,
+            )
+            .map(|resp| {
+                !resp.success
+                    || resp
+                        .data
+                        .as_ref()
+                        .is_some_and(|data| data["workMode"].is_string())
+            })
+            .unwrap_or(true))
+    {
+        let mut resp = match send_command(cmd.clone(), &flags.session) {
+            Ok(resp) => resp,
+            Err(err) => {
+                if flags.json {
+                    print_json_error(err);
+                } else {
+                    eprintln!("{} {}", color::error_indicator(), err);
+                }
+                exit(1);
+            }
+        };
+        let output_opts = OutputOptions::from_flags(&flags);
+        if flags.confirm_interactive && confirmation_prompt_from_response(&resp).is_some() {
+            resp = run_interactive_confirmations(resp, &flags, &output_opts);
+            if !resp.success {
+                exit(1);
+            }
+            return;
+        }
+        if resp.success
+            && resp
+                .data
+                .as_ref()
+                .is_some_and(|data| data["closed"] == true)
+        {
+            tls::clear_session(&flags.session);
+        }
+        output::print_response_with_opts(&resp, Some("close"), &output_opts);
+        if !resp.success {
+            exit(1);
+        }
+        return;
+    }
     attach_input_mode(&mut cmd, &flags);
     // Stdin batches are read before launch decisions so a batch of `read`
     // commands is recognized as browserless, like one given as arguments.
@@ -1811,7 +1881,11 @@ fn main() {
         plugins: Some(plugin_registry_json.as_str()),
     };
 
-    let daemon_result = match ensure_daemon(&flags.session, &daemon_opts) {
+    let daemon_result = match connection::ensure_daemon_with_work_mode(
+        &flags.session,
+        &daemon_opts,
+        flags.work_mode.as_deref(),
+    ) {
         Ok(result) => result,
         Err(e) => {
             if flags.json {
@@ -1825,9 +1899,11 @@ fn main() {
     let _daemon_was_already_running = daemon_result.already_running;
     let daemon_restarted = daemon_result.restarted;
 
+    let closing = flags.work_mode.is_some()
+        && cmd.get("action").and_then(serde_json::Value::as_str) == Some("close");
     // Auto-connect to existing browser. This is sent even when the daemon is
     // already running so launch compatibility stays idempotent.
-    if flags.auto_connect {
+    if flags.auto_connect && !closing {
         let mut launch_cmd = json!({
             "id": gen_id(),
             "action": "launch",
@@ -1853,6 +1929,7 @@ fn main() {
             launch_cmd["downloadPath"] = json!(dp);
         }
 
+        commands::attach_work_mode(&mut launch_cmd, &flags);
         let err = match send_command(launch_cmd, &flags.session) {
             Ok(resp) if resp.success => None,
             Ok(resp) => Some((
@@ -1875,7 +1952,7 @@ fn main() {
 
     // Connect via CDP if --cdp flag is set
     // Accepts either a port number (e.g., "9222") or a full URL (e.g., "ws://..." or "wss://...")
-    if let Some(ref cdp_value) = flags.cdp {
+    if let Some(cdp_value) = flags.cdp.as_ref().filter(|_| !closing) {
         // Validate CDP value eagerly (even when daemon is already running) so
         // the user gets an immediate error for bad input instead of a silent no-op.
         let launch_cmd = if cdp_value.starts_with("ws://")
@@ -1955,6 +2032,7 @@ fn main() {
             launch_cmd["downloadPath"] = json!(dp);
         }
 
+        commands::attach_work_mode(&mut launch_cmd, &flags);
         let err = match send_command(launch_cmd, &flags.session) {
             Ok(resp) if resp.success => None,
             Ok(resp) => Some((
@@ -1976,8 +2054,9 @@ fn main() {
     }
 
     // Launch with cloud provider if -p flag is set.
-    if let Some(ref provider) = flags.provider {
-        let launch_cmd = build_provider_launch_command(provider, &flags);
+    if let Some(provider) = flags.provider.as_ref().filter(|_| !closing) {
+        let mut launch_cmd = build_provider_launch_command(provider, &flags);
+        commands::attach_work_mode(&mut launch_cmd, &flags);
 
         let err = match send_command(launch_cmd, &flags.session) {
             Ok(resp) if resp.success => None,
@@ -2000,127 +2079,10 @@ fn main() {
     }
 
     // Launch headed browser or configure browser options (without CDP or provider)
-    if should_send_local_launch_config(&flags, &cmd) {
-        let mut launch_cmd = json!({
-            "id": gen_id(),
-            "action": "launch",
-        });
-        // Only send headless when the user set it on this invocation. When
-        // absent, the daemon falls back to its spawn-time AGENT_BROWSER_HEADED
-        // env, so a follow-up command without --headed (common when env vars
-        // like AGENT_BROWSER_ARGS force a launch command on every call) does
-        // not flip a headed session back to headless and relaunch the browser
-        // onto about:blank.
-        if flags.headed || flags.cli_headed {
-            launch_cmd["headless"] = json!(!flags.headed);
-        }
-        launch_cmd["plugins"] = json!(flags.plugins.clone());
-        attach_restore_config_to_command(&mut launch_cmd, &flags);
-
-        let cmd_obj = launch_cmd
-            .as_object_mut()
-            .expect("json! macro guarantees object type");
-
-        // Add executable path if specified
-        if let Some(ref exec_path) = flags.executable_path {
-            cmd_obj.insert("executablePath".to_string(), json!(exec_path));
-        }
-
-        // Add profile path if specified
-        if let Some(ref profile_path) = flags.profile {
-            cmd_obj.insert("profile".to_string(), json!(profile_path));
-        }
-
-        // Add state path if specified
-        if let Some(ref state_path) = flags.state {
-            cmd_obj.insert("storageState".to_string(), json!(state_path));
-        }
-
-        if let Some(ref proxy_str) = flags.proxy {
-            let parsed = parse_proxy(proxy_str);
-            let mut proxy_obj = json!({ "server": parsed.server });
-            if let Some(ref username) = parsed.username {
-                proxy_obj["username"] = json!(username);
-            }
-            if let Some(ref password) = parsed.password {
-                proxy_obj["password"] = json!(password);
-            }
-            if let Some(ref bypass) = flags.proxy_bypass {
-                proxy_obj["bypass"] = json!(bypass);
-            }
-            cmd_obj.insert("proxy".to_string(), proxy_obj);
-        }
-
-        if let Some(ref ua) = flags.user_agent {
-            cmd_obj.insert("userAgent".to_string(), json!(ua));
-        }
-
-        if let Some(ref a) = flags.args {
-            // Parse args (comma or newline separated)
-            let args_vec: Vec<String> = a
-                .split(&[',', '\n'][..])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            cmd_obj.insert("args".to_string(), json!(args_vec));
-        }
-
-        if !flags.extensions.is_empty() {
-            cmd_obj.insert("extensions".to_string(), json!(&flags.extensions));
-        }
-
-        if !flags.init_scripts.is_empty() {
-            cmd_obj.insert("initScripts".to_string(), json!(&flags.init_scripts));
-        }
-
-        if !flags.enable.is_empty() {
-            cmd_obj.insert("enable".to_string(), json!(&flags.enable));
-        }
-
-        if flags.ignore_https_errors {
-            launch_cmd["ignoreHTTPSErrors"] = json!(true);
-        }
-
-        attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
-
-        if flags.allow_file_access {
-            launch_cmd["allowFileAccess"] = json!(true);
-        }
-
-        apply_hide_scrollbars_launch_option(
-            &mut launch_cmd,
-            flags.cli_hide_scrollbars,
-            flags.hide_scrollbars,
-        );
-
-        if flags.webgpu || flags.cli_webgpu {
-            launch_cmd["webgpu"] = json!(flags.webgpu);
-        }
-        attach_webmcp_launch_option(&mut launch_cmd, &flags);
-
-        // Env-only opt-out for automatic Xvfb; always stamped from the CLI's
-        // fresh environment so both setting and unsetting the var take effect
-        // on daemons spawned before the change.
-        launch_cmd["noXvfb"] = json!(flags.no_xvfb);
-
-        if let Some(ref cs) = flags.color_scheme {
-            launch_cmd["colorScheme"] = json!(cs);
-        }
-
-        if let Some(ref dp) = flags.download_path {
-            launch_cmd["downloadPath"] = json!(dp);
-        }
-
-        attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
-
-        if let Some(ref engine) = flags.engine {
-            launch_cmd["engine"] = json!(engine);
-        }
-        attach_obscura_proxy_bypass(&mut launch_cmd, &flags);
-
+    if !closing && should_send_local_launch_config(&flags, &cmd) {
+        let launch_cmd = build_local_launch_command(&flags);
         match send_command(launch_cmd, &flags.session) {
             Ok(resp) if !resp.success => {
-                // Launch command failed (e.g., invalid state file, profile error)
                 let error_msg = resp
                     .error
                     .unwrap_or_else(|| "Browser launch failed".to_string());
@@ -2143,12 +2105,109 @@ fn main() {
                 }
                 exit(1);
             }
-            Ok(_) => {
-                // Launch succeeded
-            }
+            Ok(_) => {}
         }
     }
 
+    dispatch_command(cmd, &flags, &daemon_opts, daemon_restarted);
+}
+
+fn build_local_launch_command(flags: &Flags) -> serde_json::Value {
+    let mut launch_cmd = json!({
+        "id": gen_id(),
+        "action": "launch",
+    });
+    // Absent visibility choices fall back to the daemon's spawn-time environment.
+    if flags.headed || flags.cli_headed {
+        launch_cmd["headless"] = json!(!flags.headed);
+    }
+    launch_cmd["plugins"] = json!(flags.plugins.clone());
+    attach_restore_config_to_command(&mut launch_cmd, flags);
+
+    let cmd_obj = launch_cmd
+        .as_object_mut()
+        .expect("json! macro guarantees object type");
+    if let Some(ref exec_path) = flags.executable_path {
+        cmd_obj.insert("executablePath".to_string(), json!(exec_path));
+    }
+    if let Some(ref profile_path) = flags.profile {
+        cmd_obj.insert("profile".to_string(), json!(profile_path));
+    }
+    if let Some(ref state_path) = flags.state {
+        cmd_obj.insert("storageState".to_string(), json!(state_path));
+    }
+    if let Some(ref proxy_str) = flags.proxy {
+        let parsed = parse_proxy(proxy_str);
+        let mut proxy_obj = json!({ "server": parsed.server });
+        if let Some(ref username) = parsed.username {
+            proxy_obj["username"] = json!(username);
+        }
+        if let Some(ref password) = parsed.password {
+            proxy_obj["password"] = json!(password);
+        }
+        if let Some(ref bypass) = flags.proxy_bypass {
+            proxy_obj["bypass"] = json!(bypass);
+        }
+        cmd_obj.insert("proxy".to_string(), proxy_obj);
+    }
+    if let Some(ref ua) = flags.user_agent {
+        cmd_obj.insert("userAgent".to_string(), json!(ua));
+    }
+    if let Some(ref a) = flags.args {
+        let args_vec: Vec<String> = a
+            .split(&[',', '\n'][..])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        cmd_obj.insert("args".to_string(), json!(args_vec));
+    }
+    if !flags.extensions.is_empty() {
+        cmd_obj.insert("extensions".to_string(), json!(&flags.extensions));
+    }
+    if !flags.init_scripts.is_empty() {
+        cmd_obj.insert("initScripts".to_string(), json!(&flags.init_scripts));
+    }
+    if !flags.enable.is_empty() {
+        cmd_obj.insert("enable".to_string(), json!(&flags.enable));
+    }
+    if flags.ignore_https_errors {
+        launch_cmd["ignoreHTTPSErrors"] = json!(true);
+    }
+    attach_ca_cert_to_launch_command(&mut launch_cmd, flags);
+    if flags.allow_file_access {
+        launch_cmd["allowFileAccess"] = json!(true);
+    }
+    apply_hide_scrollbars_launch_option(
+        &mut launch_cmd,
+        flags.cli_hide_scrollbars,
+        flags.hide_scrollbars,
+    );
+    if flags.webgpu || flags.cli_webgpu {
+        launch_cmd["webgpu"] = json!(flags.webgpu);
+    }
+    attach_webmcp_launch_option(&mut launch_cmd, flags);
+    launch_cmd["noXvfb"] = json!(flags.no_xvfb);
+    if let Some(ref cs) = flags.color_scheme {
+        launch_cmd["colorScheme"] = json!(cs);
+    }
+    if let Some(ref dp) = flags.download_path {
+        launch_cmd["downloadPath"] = json!(dp);
+    }
+    attach_allowed_domains_to_launch_command(&mut launch_cmd, flags);
+    if let Some(ref engine) = flags.engine {
+        launch_cmd["engine"] = json!(engine);
+    }
+    attach_obscura_proxy_bypass(&mut launch_cmd, flags);
+    commands::attach_work_mode(&mut launch_cmd, flags);
+    launch_cmd
+}
+
+fn dispatch_command(
+    cmd: serde_json::Value,
+    flags: &Flags,
+    daemon_opts: &DaemonOptions,
+    daemon_restarted: bool,
+) {
     // Handle batch command: from args or stdin
     if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
         let bail = cmd.get("bail").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -2213,10 +2272,16 @@ fn send_command_with_respawn(
 ) -> Result<connection::Response, String> {
     let first_attempt = send_command(cmd.clone(), session);
     match first_attempt {
-        Err(ref e) if daemon_unreachable(e) => match ensure_daemon(session, daemon_opts) {
-            Ok(_) => send_command(cmd, session),
-            Err(_) => first_attempt,
-        },
+        Err(ref e) if daemon_unreachable(e) => {
+            match connection::ensure_daemon_with_work_mode(
+                session,
+                daemon_opts,
+                cmd.get("workMode").and_then(serde_json::Value::as_str),
+            ) {
+                Ok(_) => send_command(cmd, session),
+                Err(error) => Err(error),
+            }
+        }
         other => other,
     }
 }
@@ -2310,7 +2375,6 @@ fn run_batch(
         attach_input_mode(&mut parsed, flags);
         match parsed.get("action").and_then(|v| v.as_str()) {
             Some("read") => parsed["tls"] = json!(tls::session_options(flags, &flags.session)),
-            Some("close") => tls::clear_session(&flags.session),
             _ => {}
         }
 
@@ -2323,8 +2387,33 @@ fn run_batch(
 
         attach_pin_tab_to_command(&mut parsed, flags);
 
-        match send_command_with_respawn(parsed, &flags.session, daemon_opts) {
+        let response = if should_send_local_launch_config(flags, &parsed) {
+            send_command_with_respawn(
+                build_local_launch_command(flags),
+                &flags.session,
+                daemon_opts,
+            )
+            .and_then(|resp| {
+                if resp.success && confirmation_prompt_from_response(&resp).is_none() {
+                    send_command_with_respawn(parsed, &flags.session, daemon_opts)
+                } else {
+                    Ok(resp)
+                }
+            })
+        } else {
+            send_command_with_respawn(parsed, &flags.session, daemon_opts)
+        };
+        match response {
             Ok(resp) => {
+                if action.as_deref() == Some("close")
+                    && resp.success
+                    && resp
+                        .data
+                        .as_ref()
+                        .is_some_and(|data| data["closed"] == true)
+                {
+                    tls::clear_session(&flags.session);
+                }
                 if flags.json {
                     let mut result = json!({
                         "command": cmd_args,
@@ -2396,6 +2485,43 @@ fn run_batch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chat_rejects_work_mode_before_dispatch() {
+        let mut flags = neutral_launch_config_flags();
+        flags.work_mode = None;
+        assert!(chat_work_mode_error(&flags).is_none());
+        for mode in ["collaboration", "background"] {
+            flags.work_mode = Some(mode.to_string());
+            assert!(chat_work_mode_error(&flags)
+                .unwrap()
+                .contains("not supported by chat"));
+        }
+    }
+
+    #[test]
+    fn batch_defers_local_launch_config_until_inner_non_close_commands() {
+        let mut flags = neutral_launch_config_flags();
+        flags.session = "batch-work-mode".to_string();
+        flags.work_mode = Some("collaboration".to_string());
+        flags.headed = true;
+        flags.executable_path = Some("/sandbox/chrome".to_string());
+        flags.args = Some("--disable-dev-shm-usage".to_string());
+        for command in [json!({"action": "batch"}), json!({"action": "close"})] {
+            assert!(!should_send_local_launch_config(&flags, &command));
+        }
+        let close = parse_command(&["close".to_string()], &flags).unwrap();
+        assert_eq!(close["workMode"], "collaboration");
+        assert!(!should_send_local_launch_config(&flags, &close));
+        let navigate =
+            parse_command(&["open".to_string(), "about:blank".to_string()], &flags).unwrap();
+        assert!(should_send_local_launch_config(&flags, &navigate));
+        let launch = build_local_launch_command(&flags);
+        assert_eq!(launch["workMode"], "collaboration");
+        assert_eq!(launch["executablePath"], "/sandbox/chrome");
+        assert_eq!(launch["args"], json!(["--disable-dev-shm-usage"]));
+        assert_eq!(launch["headless"], false);
+    }
+
     #[test]
     fn input_mode_session_setting_preserves_command_override() {
         let args: Vec<String> = ["--input-mode", "smooth", "click", "#button", "--human"]

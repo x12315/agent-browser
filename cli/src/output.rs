@@ -1610,6 +1610,8 @@ Global Options:
   --session <name>     Use specific session
   --headers <json>     Set HTTP headers (scoped to this origin)
   --headed             Show browser window
+  --work-mode <mode>   collaboration (headed) or background (headless);
+                       sticky local Chrome policy, requires nondefault --session
   --enable react-devtools   Inject the React DevTools hook before any page JS
   --init-script <path>      Register a page init script (repeatable)
 
@@ -2298,6 +2300,16 @@ agent-browser close - Close the browser
 Usage: agent-browser close [options]
 
 Closes the browser instance for the current session.
+
+After a successful confirmed browser close, the shared CLI/MCP send path waits
+up to 5s for the daemon endpoint to stop accepting connections. This also applies
+inside batch, to close executed by confirm, and to internal shutdown. No extra
+sleep is needed before the next open after success.
+Timeout returns success:false, code daemon_shutdown_unconfirmed, and
+ data.daemonShutdownConfirmed:false, preserving the original closed:true proof
+(including nested confirmation results). It does not kill, resend, or auto-launch.
+Confirmation prompts, denials, errors, and outcome_unknown do not trigger this
+wait. Never blindly resend a mutation with an unknown outcome.
 
 Aliases: quit, exit
 
@@ -3136,10 +3148,24 @@ Usage: agent-browser session [operation]
 Manage isolated browser sessions. Each session has its own browser
 instance with separate cookies, storage, and state.
 
+Opt in with --session <name> --work-mode collaboration|background.
+Requires a nondefault session and locally launched Chrome. The daemon retains
+mode when omitted on later calls. Explicit close releases it; close before
+changing a protected live browser's mode or launch/daemon configuration.
+Mode overrides headed defaults; an explicit opposite --headed is an error.
+Explicit --work-mode requires a read-only session_info capability handshake before
+existing-daemon version/config restart checks and after a fresh daemon is ready.
+Native session_info returns data.workModePolicyVersion: 1. A missing/wrong marker
+or failed handshake rejects opt-in without kill, restart, or mutation. Matching
+versions or source alone are insufficient. No explicit mode keeps the existing path.
+Explicit close cleanup remains available under action-policy and confirmation rules.
+Info and response lifecycle expose workMode and effectiveMode (headed/headless),
+including effectiveLaunch; null means no policy, not proof of window visibility.
+
 Operations:
   (none)               Show current session name
   id                   Generate stable session id (--scope worktree|cwd|git-root, --prefix)
-  info                 Show daemon, launch, and restore diagnostics
+  info                 Show daemon, launch, restore, workMode/effectiveMode diagnostics
   list                 List all active sessions
 
 Environment:
@@ -3511,6 +3537,10 @@ Runs multiple commands in sequence. Commands can be passed as quoted
 arguments or piped as JSON via stdin. Results are printed in order,
 separated by blank lines (or as a JSON array with --json).
 
+Local launch configuration is applied per inner command, so an explicit close
+can release an old work mode before the next command reconfigures the browser.
+Close still obeys action-policy and confirmation rules; use --bail to stop if denied.
+
 Options:
   --bail               Stop on first error (default: continue all commands)
   --json               Output results as a JSON array
@@ -3600,6 +3630,10 @@ Sends natural language instructions to an AI model that translates them
 into agent-browser commands and executes them against the active session.
 Requires AI_GATEWAY_API_KEY to be set.
 
+Chat rejects --work-mode before making model requests because propagation to
+browser tool calls is not yet supported. Use direct CLI or MCP browser tools
+for protected sessions.
+
 In interactive mode, type "quit", "exit", or "q" to leave the REPL.
 
 Chat Options:
@@ -3665,6 +3699,9 @@ Common tools include:
   agent_browser_close      Close the browser session
 
 Each tool has typed fields such as url, selector, text, key, and session.
+Common workMode (collaboration|background) maps to --work-mode and requires a
+nondefault session. Omission inherits the daemon policy; close explicitly before
+changing a protected live browser's mode or launch/daemon configuration.
 Each tool also accepts extraArgs for advanced CLI flags and exact CLI parity.
 Tool discovery is paginated and includes read-only/open-world annotations so
 modern MCP clients can load the large typed surface incrementally.
@@ -4060,6 +4097,8 @@ Options:
   --screenshot-format <fmt>  Screenshot format: png, jpeg (or AGENT_BROWSER_SCREENSHOT_FORMAT)
   --input-mode <mode>        Session pointer movement: instant (default), smooth, human
   --headed                   Show browser window (not headless) (or AGENT_BROWSER_HEADED env)
+  --work-mode <mode>         collaboration (headed) or background (headless); sticky local
+                             Chrome policy, requires nondefault --session; no env/config key
   --webgpu                   Enable WebGPU; uses SwiftShader software Vulkan on Linux, no GPU required (or AGENT_BROWSER_WEBGPU env)
   --no-webmcp                Disable default experimental WebMCP support for locally launched Chrome
                              (or AGENT_BROWSER_NO_WEBMCP env)
@@ -4096,6 +4135,38 @@ Options:
   --config <path>            Use a custom config file (or AGENT_BROWSER_CONFIG env)
   --debug                    Debug output
   --version, -V              Show version
+
+Work modes (opt-in):
+  --session <name> --work-mode collaboration|background selects local Chrome policy.
+  Explicit --work-mode requires a read-only session_info capability handshake before
+  existing-daemon version/config restart checks and after a fresh daemon is ready.
+  Native session_info returns data.workModePolicyVersion: 1. A missing/wrong marker
+  or failed handshake rejects opt-in without kill, restart, or mutation. Matching
+  versions or source alone are insufficient. No explicit mode keeps the existing
+  path; explicit close cleanup remains available under normal policy rules.
+  Later omission inherits the daemon's mode. Explicit close releases it; policy does
+  not persist across daemon exit. Mode overrides headed config/environment defaults;
+  an explicit opposite --headed true|false is an error.
+  Cannot adopt an unprotected live browser or implicitly close/relaunch a protected
+  one for mode, launch configuration, restore-key, or daemon fingerprint changes.
+  Close only your owned session explicitly before reconfiguring; action-policy
+  and confirmation rules still apply. Batch applies local launch configuration
+  per inner command, allowing close before reconfiguration. Successful confirmed
+  close waits up to 5s for the daemon endpoint to stop; no sleep before open is
+  needed. daemon_shutdown_unconfirmed preserves close proof but is a failure:
+  do not proceed with a mode transition or bypass it with kill/resend/auto-launch.
+  Agents should report actual mode, completed work, and any required handoff;
+  headed policy alone does not prove human visibility. Chat rejects
+  --work-mode before model requests; use direct CLI or MCP browser tools instead.
+  Unsupported: external CDP, providers, auto-connect, profiles, non-Chrome engines,
+  launch-mutator plugins, and browser args overriding visibility or attachment.
+  Background rejects extensions. Linux collaboration needs an existing DISPLAY;
+  private automatic Xvfb is disabled. This does not certify physical visibility.
+  session info --json and lifecycle expose workMode/effectiveMode, also within
+  effectiveLaunch (null without policy). Check browserLaunched separately.
+  No-flag sessions retain existing behavior. No new environment/config default.
+  Fork source is not the installed CLI: deliberately use a newly built fork binary
+  and matching bundled skills. Existing live daemons are not migrated automatically.
 
 Configuration:
   agent-browser looks for agent-browser.json in these locations (lowest to highest priority):
@@ -4234,6 +4305,10 @@ Examples:
   SESSION="$(agent-browser session id --scope worktree --prefix myapp)"
   agent-browser --session "$SESSION" --restore open example.com  # Auto-save/restore state
   agent-browser session info --json                    # Inspect daemon and restore status
+  agent-browser --session research --work-mode background open example.com
+  agent-browser --session research snapshot -i          # Inherits background policy
+  agent-browser --session research close                # Releases work mode
+  agent-browser --session research --work-mode collaboration open example.com
   agent-browser chat "open google.com and search for cats"  # AI chat (single-shot)
   agent-browser chat                                        # AI chat (interactive REPL)
   agent-browser -q chat "summarize this page"               # Quiet mode (text only)

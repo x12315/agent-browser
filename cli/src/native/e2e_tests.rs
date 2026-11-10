@@ -33,6 +33,225 @@ fn get_data(resp: &Value) -> &Value {
     resp.get("data").expect("Missing 'data' in response")
 }
 
+async fn work_mode_browser_identity(state: &DaemonState) -> (String, Value) {
+    let browser = state.browser.as_ref().unwrap();
+    let processes: Value = browser
+        .client
+        .send_command("SystemInfo.getProcessInfo", None, None)
+        .await
+        .unwrap();
+    let pid = processes["processInfo"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|process| process["type"] == "browser")
+        .unwrap()["id"]
+        .clone();
+    (browser.active_session_id().unwrap().to_string(), pid)
+}
+
+async fn assert_sticky_work_mode(mode: &str) {
+    let vars = [
+        "AGENT_BROWSER_CDP",
+        "AGENT_BROWSER_PROVIDER",
+        "AGENT_BROWSER_AUTO_CONNECT",
+        "AGENT_BROWSER_PROFILE",
+        "AGENT_BROWSER_ENGINE",
+        "AGENT_BROWSER_ARGS",
+        "AGENT_BROWSER_EXTENSIONS",
+        "AGENT_BROWSER_STATE",
+        "AGENT_BROWSER_PLUGINS",
+        "AGENT_BROWSER_HEADED",
+    ];
+    let guard = EnvGuard::new(&vars);
+    for var in vars {
+        guard.remove(var);
+    }
+    guard.set(
+        "AGENT_BROWSER_HEADED",
+        if mode == "background" { "1" } else { "0" },
+    );
+    let mut state = DaemonState::new();
+    state.session_id = format!("e2e-work-mode-{}-{}", mode, std::process::id());
+    let launched = execute_command(
+        &json!({"id": "1", "action": "launch", "workMode": mode, "plugins": []}),
+        &mut state,
+    )
+    .await;
+    assert_success(&launched);
+    let version: Value = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .client
+        .send_command("Browser.getVersion", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        version["userAgent"]
+            .as_str()
+            .unwrap()
+            .contains("HeadlessChrome"),
+        mode == "background"
+    );
+    let identity = work_mode_browser_identity(&state).await;
+    let effective = if mode == "background" {
+        "headless"
+    } else {
+        "headed"
+    };
+    let opposite = if mode == "background" {
+        "collaboration"
+    } else {
+        "background"
+    };
+    let inherited = execute_command(&json!({"id": "2", "action": "launch", "headless": mode != "background", "headedDefault": true, "plugins": []}), &mut state).await;
+    assert_success(&inherited);
+    assert_eq!(inherited["data"]["lifecycle"]["workMode"], mode);
+    assert_eq!(inherited["data"]["lifecycle"]["effectiveMode"], effective);
+    for command in [
+        json!({"action": "evaluate", "script": "globalThis.workModeUnexpectedSideEffect = true", "workMode": opposite}),
+        json!({"action": "launch", "requestedHeaded": mode == "background"}),
+        json!({"action": "launch", "headless": mode != "background"}),
+        json!({"action": "launch", "userAgent": "changed-work-mode-config", "plugins": []}),
+        json!({"action": "navigate", "url": "about:blank", "restoreKey": "changed-restore"}),
+        json!({"action": "launch", "cdpPort": 9222}),
+        json!({"action": "launch", "autoConnect": true}),
+        json!({"action": "launch", "provider": "browserbase"}),
+        json!({"action": "launch", "profile": "/tmp/unsupported-profile"}),
+        json!({"action": crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION}),
+    ] {
+        let refused = execute_command(&command, &mut state).await;
+        assert_eq!(refused["success"], false, "{}", refused);
+        assert_eq!(work_mode_browser_identity(&state).await, identity);
+    }
+    assert_evaluate(
+        &mut state,
+        "3",
+        "globalThis.workModeUnexpectedSideEffect === undefined",
+        json!(true),
+    )
+    .await;
+    let policy_dir = tempfile::tempdir().unwrap();
+    let policy_path = policy_dir.path().join("close-policy.json");
+    for rule in ["deny", "confirm"] {
+        std::fs::write(&policy_path, json!({(rule): ["close"]}).to_string()).unwrap();
+        state.policy =
+            Some(super::policy::ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
+        let resp = execute_command(
+            &json!({"id": "gated-close", "action": "close", "workMode": opposite}),
+            &mut state,
+        )
+        .await;
+        if rule == "deny" {
+            assert_eq!(resp["success"], false);
+        } else {
+            assert_eq!(resp["data"]["confirmation_required"], true);
+            assert_success(&execute_command(&json!({"action": "deny"}), &mut state).await);
+        }
+        assert_eq!(work_mode_browser_identity(&state).await, identity);
+        let info = execute_command(&json!({"action": "session_info"}), &mut state).await;
+        assert_eq!(info["data"]["workMode"], mode);
+    }
+    state.policy = None;
+    let info = execute_command(&json!({"action": "session_info"}), &mut state).await;
+    assert_eq!(info["data"]["workMode"], mode);
+    assert_eq!(info["data"]["effectiveLaunch"]["effectiveMode"], effective);
+    std::fs::write(&policy_path, r#"{"confirm":["close"]}"#).unwrap();
+    state.policy = Some(super::policy::ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
+    let pending_close = execute_command(
+        &json!({"action": "close", "workMode": opposite, "requestedHeaded": mode == "background"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(pending_close["data"]["confirmation_required"], true);
+    assert_eq!(work_mode_browser_identity(&state).await, identity);
+    let confirmed = execute_command(&json!({"action": "confirm"}), &mut state).await;
+    assert_success(&confirmed);
+    assert_success(&confirmed["data"]["result"]);
+    assert_eq!(confirmed["data"]["result"]["data"]["closed"], true);
+    assert!(state.browser.is_none());
+    state.policy = None;
+    let closed_info = execute_command(&json!({"action": "session_info"}), &mut state).await;
+    assert!(closed_info["data"]["workMode"].is_null());
+    let changed = execute_command(
+        &json!({"action": "session_info", "workMode": opposite}),
+        &mut state,
+    )
+    .await;
+    assert_success(&changed);
+    assert_eq!(changed["data"]["workMode"], opposite);
+    if mode == "collaboration" {
+        let relaunched =
+            execute_command(&json!({"action": "launch", "plugins": []}), &mut state).await;
+        assert_success(&relaunched);
+        assert_eq!(relaunched["data"]["lifecycle"]["effectiveMode"], "headless");
+        assert_ne!(work_mode_browser_identity(&state).await.1, identity.1);
+    }
+    assert_success(&execute_command(&json!({"action": "close"}), &mut state).await);
+}
+
+/// Runs the large, unoptimized work-mode fixture on an owned 16 MiB stack.
+/// Its combined async command sequence can overflow a default test thread during
+/// future construction; this differs from the built CLI's ordinary command path
+/// and is not evidence that the production runtime needs a larger stack.
+/// Both the runtime and fixture future are created inside the sized thread, and
+/// joining propagates assertion panics after the awaited fixture completes.
+fn run_work_mode_fixture<F, Fut>(fixture: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .name("work-mode-e2e".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create work-mode E2E runtime");
+            runtime.block_on(fixture());
+        })
+        .expect("failed to spawn work-mode E2E thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[test]
+#[ignore = "requires sandbox Chrome; no host browser tests"]
+fn e2e_work_mode_background_sticky_and_conflicts_preserve_browser() {
+    run_work_mode_fixture(|| assert_sticky_work_mode("background"));
+}
+
+#[test]
+#[ignore = "requires sandbox Chrome and existing DISPLAY on Linux; no auto-Xvfb"]
+fn e2e_work_mode_collaboration_sticky_and_conflicts_preserve_browser() {
+    run_work_mode_fixture(|| assert_sticky_work_mode("collaboration"));
+}
+
+#[test]
+#[ignore = "requires sandbox Chrome; no host browser tests"]
+fn e2e_work_mode_cannot_adopt_unprotected_live_browser() {
+    run_work_mode_fixture(assert_cannot_adopt_unprotected_live_browser);
+}
+
+async fn assert_cannot_adopt_unprotected_live_browser() {
+    let mut state = DaemonState::new();
+    state.session_id = format!("e2e-work-mode-adopt-{}", std::process::id());
+    assert_success(
+        &execute_command(&json!({"action": "launch", "headless": true}), &mut state).await,
+    );
+    let identity = work_mode_browser_identity(&state).await;
+    let refused = execute_command(
+        &json!({"action": "evaluate", "script": "42", "workMode": "background"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(refused["success"], false);
+    assert_eq!(work_mode_browser_identity(&state).await, identity);
+    assert_success(&execute_command(&json!({"action": "close"}), &mut state).await);
+}
+
 async fn select_values(
     state: &mut DaemonState,
     id: &str,
